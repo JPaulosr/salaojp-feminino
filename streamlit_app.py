@@ -14,7 +14,11 @@ sheet = spreadsheet.worksheet("Base de Dados")
 
 # Carregar dados
 dados = pd.DataFrame(sheet.get_all_records())
-dados["Data"] = pd.to_datetime(dados["Data"], dayfirst=True)
+dados["Data"] = pd.to_datetime(dados["Data"], dayfirst=True, errors="coerce")
+dados = dados.dropna(subset=["Data", "Cliente"])
+
+# Normalizar nomes (tira espaços e padroniza para comparação)
+dados["Cliente"] = dados["Cliente"].astype(str).str.strip()
 
 # Sidebar – Seleção do Cliente
 st.sidebar.markdown("🔎 **Selecione seu nome**")
@@ -24,15 +28,18 @@ nome_cliente = st.sidebar.selectbox(" ", clientes_unicos)
 # Filtrar dados do cliente selecionado
 dados_cliente = dados[dados["Cliente"] == nome_cliente]
 
-# Título
-st.markdown(f"### 📋 Histórico de {nome_cliente.lower()}")
+# Título principal
+st.markdown(f"### 📋 Histórico de {nome_cliente}")
 
 # Verificação segura das colunas
 colunas_esperadas = ["Data", "Serviço", "Profissional", "Valor"]
 colunas_disponiveis = dados_cliente.columns.tolist()
 colunas_para_exibir = [col for col in colunas_esperadas if col in colunas_disponiveis]
 
-if colunas_para_exibir:
-    st.dataframe(dados_cliente[colunas_para_exibir].sort_values("Data", ascending=False))
+# Exibir tabela ou aviso
+if not dados_cliente.empty and colunas_para_exibir:
+    tabela = dados_cliente[colunas_para_exibir].sort_values("Data", ascending=False).copy()
+    tabela["Data"] = tabela["Data"].dt.strftime("%d/%m/%Y")  # formato brasileiro
+    st.dataframe(tabela, use_container_width=True)
 else:
-    st.warning("❗ Nenhum dado disponível para exibir o histórico desse cliente.")
+    st.info("⚠️ Nenhum atendimento encontrado para este nome ainda. Assim que houver registros, eles aparecerão aqui.")
