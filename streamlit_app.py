@@ -1,63 +1,38 @@
 import streamlit as st
 import pandas as pd
-from google.oauth2.service_account import Credentials
 import gspread
+from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="Painel do Cliente", layout="wide")
-st.title("💇 Painel do Cliente")
+# Autenticação com Google Sheets
+scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+client = gspread.authorize(credentials)
 
-# --- Autenticação com Google Sheets ---
-@st.cache_data
-def carregar_base():
-    escopos = ["https://www.googleapis.com/auth/spreadsheets"]
-    credenciais = Credentials.from_service_account_info(
-        st.secrets["GCP_SERVICE_ACCOUNT"], scopes=escopos
-    )
-    cliente = gspread.authorize(credenciais)
-    planilha = cliente.open_by_url(st.secrets["PLANILHA_URL"])
-    aba = planilha.worksheet("Base de Dados")
-    dados = aba.get_all_records()
-    return pd.DataFrame(dados)
+# Nome da planilha e aba
+spreadsheet = client.open_by_url("https://docs.google.com/spreadsheets/d/1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE/edit")
+sheet = spreadsheet.worksheet("Base de Dados")
 
-base = carregar_base()
+# Carregar dados
+dados = pd.DataFrame(sheet.get_all_records())
+dados["Data"] = pd.to_datetime(dados["Data"], dayfirst=True)
 
-# --- Normalização e preparação ---
-base.columns = [col.strip().capitalize() for col in base.columns]
-base["Data"] = pd.to_datetime(base["Data"], errors="coerce")
+# Sidebar – Seleção do Cliente
+st.sidebar.markdown("🔎 **Selecione seu nome**")
+clientes_unicos = sorted(dados["Cliente"].unique())
+nome_cliente = st.sidebar.selectbox(" ", clientes_unicos)
 
-# --- Seleção do cliente ---
-clientes_unicos = sorted(base["Cliente"].dropna().unique())
-cliente_selecionado = st.selectbox("🔎 Selecione seu nome", clientes_unicos)
+# Filtrar dados do cliente selecionado
+dados_cliente = dados[dados["Cliente"] == nome_cliente]
 
-# --- Dados do cliente ---
-dados_cliente = base[base["Cliente"] == cliente_selecionado].copy()
+# Título
+st.markdown(f"### 📋 Histórico de {nome_cliente.lower()}")
 
-if dados_cliente.empty:
-    st.warning("Nenhum atendimento encontrado.")
+# Verificação segura das colunas
+colunas_esperadas = ["Data", "Serviço", "Profissional", "Valor"]
+colunas_disponiveis = dados_cliente.columns.tolist()
+colunas_para_exibir = [col for col in colunas_esperadas if col in colunas_disponiveis]
+
+if colunas_para_exibir:
+    st.dataframe(dados_cliente[colunas_para_exibir].sort_values("Data", ascending=False))
 else:
-    st.subheader(f"📋 Histórico de {cliente_selecionado}")
-    st.dataframe(dados_cliente[["Data", "Serviço", "Profissional", "Valor"]].sort_values("Data", ascending=False))
-
-    st.subheader("📅 Próximos cuidados")
-    ult_data = dados_cliente["Data"].max()
-    if ult_data:
-        st.markdown(f"- Último atendimento: **{ult_data.strftime('%d/%m/%Y')}**")
-        st.markdown("- Recomendação: retorno a cada **30 dias**")
-        proxima = ult_data + pd.Timedelta(days=30)
-        st.markdown(f"- Próxima visita sugerida: **{proxima.strftime('%d/%m/%Y')}**")
-
-# --- Imagem do cliente (opcional) ---
-st.subheader("🖼️ Sua imagem no sistema")
-status_url = "clientes_status"
-try:
-    aba_status = gspread.authorize(Credentials.from_service_account_info(
-        st.secrets["GCP_SERVICE_ACCOUNT"], scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    ).open_by_url(st.secrets["PLANILHA_URL"]).worksheet(status_url)
-    df_status = pd.DataFrame(aba_status.get_all_records())
-    imagem = df_status[df_status["Cliente"] == cliente_selecionado]["Foto"].values
-    if imagem and imagem[0]:
-        st.image(imagem[0], width=300)
-    else:
-        st.info("Imagem não cadastrada.")
-except:
-    st.warning("Não foi possível carregar imagem do cliente.")
+    st.warning("❗ Nenhum dado disponível para exibir o histórico desse cliente.")
