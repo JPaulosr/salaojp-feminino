@@ -1,4 +1,16 @@
 streamlit
 pandas
+openpyxl
+plotly
+unidecode
+streamlit>=1.30.0
+streamlit-extras
 gspread
-google-auth
+gspread_dataframe
+oauth2client
+google-api-python-client
+requests
+cloudinary
+streamlit-aggrid
+streamlit-searchbox
+babel
