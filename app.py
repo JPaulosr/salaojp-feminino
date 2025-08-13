@@ -12,7 +12,6 @@ st.title("💅 Dashboard Feminino")
 # =========================
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 ABA_FEM_BASE = "Base de Dados Feminino"
-ABA_STATUS_FEM = "clientes_status_feminino"
 
 @st.cache_resource
 def conectar_sheets():
@@ -24,43 +23,66 @@ def conectar_sheets():
     creds = Credentials.from_service_account_info(info, scopes=escopo)
     return gspread.authorize(creds).open_by_key(SHEET_ID)
 
-def _coerce_valor(series):
-    # se já for numérico (por UNFORMATTED_VALUE), mantenha
+def _coerce_valor(series: pd.Series) -> pd.Series:
+    # se já vier numérico, mantém
     if pd.api.types.is_numeric_dtype(series):
         return series.fillna(0).astype(float)
-    # senão, tenta normalizar textos como "R$ 25,00"
+    # normaliza textos "R$ 25,00"
     s = (series.astype(str)
-                .str.replace("R$", "", regex=False)
-                .str.replace(" ", "", regex=False)
-                .str.replace(".", "", regex=False)   # milhar
-                .str.replace(",", ".", regex=False)) # decimal
+               .str.replace("R$", "", regex=False)
+               .str.replace(" ", "", regex=False)
+               .str.replace(".", "", regex=False)   # milhar
+               .str.replace(",", ".", regex=False)) # decimal
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+def _parse_data_sheets(col: pd.Series) -> pd.Series:
+    """
+    Converte datas vindas do Sheets que podem estar como:
+    - string (ex: 07/06/2025)
+    - número serial do Sheets (dias desde 1899-12-30)
+    - mix dos dois
+    """
+    s = col.copy()
+
+    # tenta como texto (dd/mm/aaaa)
+    dt_txt = pd.to_datetime(s, errors="coerce", dayfirst=True, infer_datetime_format=True)
+
+    # tenta como número serial do Sheets
+    s_num = pd.to_numeric(s, errors="coerce")
+    dt_num = pd.to_datetime(s_num, unit="D", origin="1899-12-30")
+
+    # prioriza texto; onde for NaT, usa o serial
+    dt = dt_txt.combine_first(dt_num)
+
+    return dt
 
 @st.cache_data(ttl=300)
 def carregar_base_feminina() -> pd.DataFrame:
     ss = conectar_sheets()
     ws = ss.worksheet(ABA_FEM_BASE)
 
-    # Lê sem formatação para evitar "R$" e vírgula
+    # Lê valores crus (datas podem vir como números seriais)
     rows = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
     if not rows:
         return pd.DataFrame()
-    df = pd.DataFrame(rows[1:], columns=rows[0]).dropna(how="all")
-    df.columns = [str(c).strip() for c in df.columns]
 
-    # Data
-    if "Data" in df.columns:
-        df["Data"] = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
-        df = df.dropna(subset=["Data"])
-        df["Ano"]  = df["Data"].dt.year
-        df["Mês"]  = df["Data"].dt.month
-        df["Ano-Mês"] = df["Data"].dt.to_period("M").astype(str)
+    df = pd.DataFrame(rows[1:], columns=[str(c).strip() for c in rows[0]])
+    df = df.dropna(how="all")
+    df.columns = [str(c).strip() for c in df.columns]
 
     # Valor numérico
     if "Valor" in df.columns:
         df["ValorNum"] = _coerce_valor(df["Valor"])
     else:
         df["ValorNum"] = 0.0
+
+    # Data correta (string e/ou serial Sheets)
+    if "Data" in df.columns:
+        df["Data"] = _parse_data_sheets(df["Data"])
+        df = df.dropna(subset=["Data"])
+        df["Ano"] = df["Data"].dt.year
+        df["Mês"] = df["Data"].dt.month
+        df["Ano-Mês"] = df["Data"].dt.to_period("M").astype(str)
 
     return df
 
@@ -70,22 +92,23 @@ if df.empty:
     st.stop()
 
 # =========================
-# FILTROS
+# FILTROS (agora com anos corretos)
 # =========================
 st.sidebar.header("🎛️ Filtros")
 anos = sorted(df["Ano"].dropna().unique(), reverse=True)
 ano = st.sidebar.selectbox("🗓️ Ano", anos)
 
-meses_pt = {1:"Janeiro",2:"Fevereiro",3:"Março",4:"Abril",5:"Maio",6:"Junho",7:"Julho",8:"Agosto",9:"Setembro",10:"Outubro",11:"Novembro",12:"Dezembro"}
-meses_disp = sorted(df[df["Ano"]==ano]["Mês"].dropna().unique())
+meses_pt = {1:"Janeiro",2:"Fevereiro",3:"Março",4:"Abril",5:"Maio",6:"Junho",
+            7:"Julho",8:"Agosto",9:"Setembro",10:"Outubro",11:"Novembro",12:"Dezembro"}
+meses_disp = sorted(df[df["Ano"] == ano]["Mês"].dropna().unique())
 mes_labels = [meses_pt[m] for m in meses_disp]
 meses_sel = st.sidebar.multiselect("📆 Meses (opcional)", mes_labels, default=mes_labels)
 
 if meses_sel:
     meses_num = [k for k,v in meses_pt.items() if v in meses_sel]
-    df = df[(df["Ano"]==ano) & (df["Mês"].isin(meses_num))]
+    df = df[(df["Ano"] == ano) & (df["Mês"].isin(meses_num))]
 else:
-    df = df[df["Ano"]==ano]
+    df = df[df["Ano"] == ano]
 
 # =========================
 # Excluir FIADO apenas na receita
@@ -100,6 +123,7 @@ df_receita = df[~mask_fiado].copy()
 receita_total = float(df_receita["ValorNum"].sum())
 total_atend   = len(df)
 
+# sua regra de clientes únicos
 data_limite = pd.to_datetime("2025-05-11")
 antes  = df[df["Data"] < data_limite]
 depois = df[df["Data"] >= data_limite].drop_duplicates(subset=["Cliente","Data"])
@@ -113,7 +137,7 @@ c3.metric("🎯 Ticket Médio", f"R$ {ticket:,.2f}".replace(",", "v").replace(".
 c4.metric("🟢 Clientes Ativos", clientes_unicos)
 
 # =========================
-# NOVO BLOCO: Receita Mensal do ano selecionado
+# 📆 Receita Mensal
 # =========================
 st.markdown("### 📆 Receita Mensal (Ano selecionado)")
 if not df_receita.empty:
@@ -134,7 +158,7 @@ else:
     st.info("Sem receita para o período filtrado.")
 
 # =========================
-# Receita por Funcionário
+# 📊 Receita por Funcionário
 # =========================
 st.markdown("### 📊 Receita por Funcionário")
 if "Funcionário" in df_receita.columns:
@@ -146,7 +170,7 @@ else:
     st.info("A coluna **Funcionário** não existe na base.")
 
 # =========================
-# Receita por Tipo
+# 🧾 Receita por Tipo
 # =========================
 st.markdown("### 🧾 Receita por Tipo")
 df_tipo = df_receita.copy()
@@ -162,7 +186,7 @@ if "Serviço" in df_tipo.columns:
     st.plotly_chart(fig2, use_container_width=True)
 
 # =========================
-# Top 10 Clientes
+# 🥇 Top 10 Clientes
 # =========================
 st.markdown("### 🥇 Top 10 Clientes (Feminino)")
 nomes_excluir = ["boliviano","brasileiro","menino"]
