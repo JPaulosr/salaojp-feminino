@@ -126,16 +126,6 @@ if df.empty:
     st.stop()
 
 # =========================
-# DIAGNÓSTICO (opcional)
-# =========================
-with st.expander("🔎 Diagnóstico da Leitura (clique para abrir)"):
-    st.write("Exemplos de Valor → ValorNum:")
-    if "Valor" in df.columns:
-        prev = df[["Valor", "ValorNum"]].head(10)
-        st.dataframe(prev, use_container_width=True)
-    st.write("Amostra:", df.head(10))
-
-# =========================
 # FILTROS
 # =========================
 st.sidebar.header("🎛️ Filtros")
