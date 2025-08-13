@@ -53,13 +53,13 @@ def atualizar_status_clientes(ultimos_status):
         dados = aba_status.get_all_records()
 
         atualizados = 0
-        for i, linha in enumerate(dados, start=2):  # começa na linha 2
+        for i, linha in enumerate(dados, start=2):
             nome = linha.get("Cliente", "").strip()
             status_atual = linha.get("Status", "").strip()
             status_novo = ultimos_status.get(nome)
 
             if status_novo and status_novo != status_atual:
-                aba_status.update_cell(i, 2, status_novo)  # coluna 2 = "Status"
+                aba_status.update_cell(i, 2, status_novo)
                 atualizados += 1
 
         return atualizados
@@ -70,6 +70,28 @@ def atualizar_status_clientes(ultimos_status):
 # === Executa carregamento e atualiza status ===
 df = carregar_dados()
 df_status = carregar_status()
+
+# === Filtro de RECEITA: excluir FIADO dos valores, mas manter frequência/histórico ===
+col_conta = next((c for c in df.columns
+                  if c.strip().lower() in ["conta", "forma de pagamento", "pagamento", "status"]), None)
+
+if col_conta:
+    serie_conta = (
+        df[col_conta]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    mask_fiado = serie_conta.eq("fiado")
+else:
+    mask_fiado = pd.Series(False, index=df.index)
+
+df_receita = df[~mask_fiado].copy()
+df_receita["ValorNum"] = pd.to_numeric(df_receita["Valor"], errors="coerce").fillna(0)
+
+df_fiado = df[mask_fiado].copy()
+df_fiado["ValorNum"] = pd.to_numeric(df_fiado["Valor"], errors="coerce").fillna(0)
 
 # === Lógica de atualização de status ===
 hoje = pd.Timestamp.today().normalize()
@@ -102,9 +124,11 @@ col4.metric("🚩 Inativos", inativos)
 nomes_ignorar = ["boliviano", "brasileiro", "menino", "menino boliviano"]
 normalizar = lambda s: str(s).lower().strip()
 df = df[~df["Cliente"].apply(lambda x: normalizar(x) in nomes_ignorar)]
+df_receita = df_receita[~df_receita["Cliente"].apply(lambda x: normalizar(x) in nomes_ignorar)]
+df_fiado = df_fiado[~df_fiado["Cliente"].apply(lambda x: normalizar(x) in nomes_ignorar)]
 
 # === Ranking geral ===
-ranking = df.groupby("Cliente")["Valor"].sum().reset_index()
+ranking = df_receita.groupby("Cliente")["ValorNum"].sum().reset_index().rename(columns={"ValorNum": "Valor"})
 ranking = ranking.sort_values(by="Valor", ascending=False)
 ranking["Valor Formatado"] = ranking["Valor"].apply(
     lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
@@ -137,26 +161,29 @@ st.plotly_chart(fig_top, use_container_width=True)
 # === Comparativo ===
 st.subheader("⚖️ Comparar dois clientes")
 clientes_disponiveis = ranking["Cliente"].tolist()
-col1, col2 = st.columns(2)
-c1 = col1.selectbox("👤 Cliente 1", clientes_disponiveis)
-c2 = col2.selectbox("👤 Cliente 2", clientes_disponiveis, index=1 if len(clientes_disponiveis) > 1 else 0)
+colA, colB = st.columns(2)
+c1 = colA.selectbox("👤 Cliente 1", clientes_disponiveis)
+c2 = colB.selectbox("👤 Cliente 2", clientes_disponiveis, index=1 if len(clientes_disponiveis) > 1 else 0)
 
-df_c1 = df[df["Cliente"] == c1]
-df_c2 = df[df["Cliente"] == c2]
+df_c1_val = df_receita[df_receita["Cliente"] == c1]
+df_c2_val = df_receita[df_receita["Cliente"] == c2]
+df_c1_hist = df[df["Cliente"] == c1]
+df_c2_hist = df[df["Cliente"] == c2]
 
-def resumo_cliente(df_cliente):
-    total = df_cliente["Valor"].sum()
-    servicos = df_cliente["Serviço"].nunique()
-    media = df_cliente.groupby("Data")["Valor"].sum().mean()
-    servicos_detalhados = df_cliente["Serviço"].value_counts().rename("Quantidade")
+def resumo_cliente(df_val, df_hist):
+    total = df_val["ValorNum"].sum()
+    servicos = df_hist["Serviço"].nunique()
+    media = df_val.groupby("Data")["ValorNum"].sum().mean()
+    media = 0 if pd.isna(media) else media
+    servicos_detalhados = df_hist["Serviço"].value_counts().rename("Quantidade")
     return pd.Series({
         "Total Receita": f"R$ {total:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."),
         "Serviços Distintos": servicos,
         "Tique Médio": f"R$ {media:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
     }), servicos_detalhados
 
-resumo1, servicos1 = resumo_cliente(df_c1)
-resumo2, servicos2 = resumo_cliente(df_c2)
+resumo1, servicos1 = resumo_cliente(df_c1_val, df_c1_hist)
+resumo2, servicos2 = resumo_cliente(df_c2_val, df_c2_hist)
 
 resumo_geral = pd.concat([resumo1.rename(c1), resumo2.rename(c2)], axis=1)
 servicos_comparativo = pd.concat([servicos1.rename(c1), servicos2.rename(c2)], axis=1).fillna(0).astype(int)
@@ -165,9 +192,59 @@ st.dataframe(resumo_geral, use_container_width=True)
 st.markdown("**Serviços Realizados por Tipo**")
 st.dataframe(servicos_comparativo, use_container_width=True)
 
+# === BLOCO DE FIADOS ===
+st.markdown("### 💳 Fiados — Resumo e Detalhes")
+
+colf1, colf2, colf3 = st.columns(3)
+total_fiado = df_fiado["ValorNum"].sum()
+clientes_fiado = df_fiado["Cliente"].nunique()
+registros_fiado = len(df_fiado)
+colf1.metric("💸 Total em fiado (aberto)", f"R$ {total_fiado:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
+colf2.metric("👤 Clientes com fiado", int(clientes_fiado))
+colf3.metric("🧾 Registros de fiado", int(registros_fiado))
+
+if not df_fiado.empty:
+    st.markdown("**Top 10 clientes em fiado (valor em aberto)**")
+    top_fiado = (
+        df_fiado.groupby("Cliente")["ValorNum"]
+        .sum()
+        .reset_index()
+        .sort_values(by="ValorNum", ascending=False)
+        .head(10)
+    )
+    top_fiado["Valor Formatado"] = top_fiado["ValorNum"].apply(
+        lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    )
+    fig_fiado = px.bar(
+        top_fiado,
+        x="Cliente",
+        y="ValorNum",
+        text=top_fiado["Valor Formatado"],
+        labels={"ValorNum": "Fiado (R$)"},
+        color="Cliente"
+    )
+    fig_fiado.update_traces(textposition="outside")
+    fig_fiado.update_layout(showlegend=False, height=380, template="plotly_white")
+    st.plotly_chart(fig_fiado, use_container_width=True)
+
+    fiado_detalhe = df_fiado[["Data", "Cliente", "Serviço", "ValorNum"]].sort_values(
+        by=["Cliente", "Data"], ascending=[True, False]
+    )
+    fiado_detalhe.rename(columns={"ValorNum": "Valor"}, inplace=True)
+    fiado_detalhe["Valor"] = fiado_detalhe["Valor"].apply(
+        lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    )
+    st.markdown("**Detalhamento (fiados em aberto)**")
+    st.dataframe(fiado_detalhe, use_container_width=True)
+
+    csv_bytes = fiado_detalhe.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("⬇️ Baixar fiados (CSV)", data=csv_bytes, file_name="fiados_em_aberto.csv", mime="text/csv")
+else:
+    st.info("Nenhum fiado em aberto encontrado para os filtros atuais.")
+
 # === Navegar para detalhamento ===
 st.subheader("🔍 Ver detalhamento de um cliente")
-cliente_escolhido = st.selectbox("📌 Escolha um cliente", clientes_disponiveis)
+cliente_escolhido = st.selectbox("📌 Escolha um cliente", ranking["Cliente"].tolist())
 
 if st.button("➡ Ver detalhes"):
     st.session_state["cliente"] = cliente_escolhido
