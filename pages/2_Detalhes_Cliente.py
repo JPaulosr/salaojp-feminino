@@ -21,7 +21,8 @@ STATUS_ALVOS = [
     "clientes_status feminino", "status_feminino"
 ]
 
-def norm(s: str) -> str:
+# ---------------- Utils ----------------
+def norm_ws(s: str) -> str:
     if s is None: return ""
     s = str(s)
     s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
@@ -53,12 +54,12 @@ def achar_col(df, nomes):
 def find_worksheet(planilha, alvos_norm):
     wss = planilha.worksheets()
     titulos = [ws.title for ws in wss]
-    titulos_norm = [norm(t) for t in titulos]
-    for ws, tnorm in zip(wss, titulos_norm):
-        if tnorm in alvos_norm:
+    tnorms  = [norm_ws(t) for t in titulos]
+    for ws, t in zip(wss, tnorms):
+        if t in alvos_norm:
             return ws
-    for ws, tnorm in zip(wss, titulos_norm):
-        if any(a in tnorm for a in alvos_norm):
+    for ws, t in zip(wss, tnorms):
+        if any(a in t for a in alvos_norm):
             return ws
     st.error("❌ Não encontrei a aba feminina. Guias disponíveis:\n- " + "\n- ".join(titulos))
     st.stop()
@@ -66,37 +67,52 @@ def find_worksheet(planilha, alvos_norm):
 @st.cache_resource
 def conectar_sheets():
     info = st.secrets["GCP_SERVICE_ACCOUNT"]
-    escopo = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    cred = Credentials.from_service_account_info(info, scopes=escopo)
+    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    cred = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(cred).open_by_key(SHEET_ID)
 
 @st.cache_data
 def carregar_base_feminino():
     sh = conectar_sheets()
-    ws = find_worksheet(sh, [norm(x) for x in BASE_ALVOS])
+    ws = find_worksheet(sh, [norm_ws(x) for x in BASE_ALVOS])
     df = get_as_dataframe(ws).dropna(how="all")
     df.columns = [c.strip() for c in df.columns]
+
     if "Data" not in df.columns:
         st.error("❌ Coluna 'Data' não encontrada na aba feminina."); st.stop()
+
+    # Normaliza campos chave
     df["Data"] = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
     df = df.dropna(subset=["Data"])
-    # padroniza colunas
+
     col_serv = achar_col(df, ["Serviço", "Servico"])
-    if col_serv and col_serv != "Serviço": df.rename(columns={col_serv:"Serviço"}, inplace=True)
+    if col_serv and col_serv != "Serviço": df.rename(columns={col_serv: "Serviço"}, inplace=True)
     col_valor = achar_col(df, ["Valor"])
-    if col_valor and col_valor != "Valor": df.rename(columns={col_valor:"Valor"}, inplace=True)
+    if col_valor and col_valor != "Valor": df.rename(columns={col_valor: "Valor"}, inplace=True)
     col_conta = achar_col(df, ["Conta", "Forma de pagamento", "Pagamento", "Status"])
-    if col_conta and col_conta != "Conta": df.rename(columns={col_conta:"Conta"}, inplace=True)
+    if col_conta and col_conta != "Conta": df.rename(columns={col_conta: "Conta"}, inplace=True)
     col_cli = achar_col(df, ["Cliente"])
-    if col_cli and col_cli != "Cliente": df.rename(columns={col_cli:"Cliente"}, inplace=True)
+    if col_cli and col_cli != "Cliente": df.rename(columns={col_cli: "Cliente"}, inplace=True)
+
+    # Parser de moeda
     df["ValorNum"] = df["Valor"].apply(parse_valor_qualquer)
+
+    # Chaves para evitar duplicados no selectbox
+    df["ClienteRaw"]   = df["Cliente"].astype(str)
+    df["ClienteKey"]   = df["ClienteRaw"].str.strip().str.lower()       # chave única
+    df["ClienteLabel"] = df["ClienteRaw"].str.strip().str.title()       # exibição
+
+    # Remover nomes genéricos (se existirem)
+    ban = {"boliviano", "brasileiro", "menino", "menino boliviano"}
+    df = df[~df["ClienteKey"].isin(ban)]
+
     return df
 
 @st.cache_data
 def carregar_status_feminino():
     try:
         sh = conectar_sheets()
-        ws = find_worksheet(sh, [norm(x) for x in STATUS_ALVOS])
+        ws = find_worksheet(sh, [norm_ws(x) for x in STATUS_ALVOS])
         df = get_as_dataframe(ws).dropna(how="all")
         df.columns = [c.strip() for c in df.columns]
         c_cli = achar_col(df, ["Cliente"]); c_sta = achar_col(df, ["Status"])
@@ -105,49 +121,77 @@ def carregar_status_feminino():
         out = df[[c_cli, c_sta]].copy()
         out.columns = ["Cliente","Status"]
         out["Cliente"] = out["Cliente"].astype(str).str.strip()
-        out["Status"] = out["Status"].astype(str).str.strip()
+        out["Status"]  = out["Status"].astype(str).str.strip()
+        # Criar chave para *join* seguro
+        out["ClienteKey"] = out["Cliente"].str.strip().str.lower()
         return out
     except Exception:
-        return pd.DataFrame(columns=["Cliente","Status"])
+        return pd.DataFrame(columns=["Cliente","Status","ClienteKey"])
 
 # ---------- Dados ----------
 df = carregar_base_feminino()
 df_status = carregar_status_feminino()
 
-# Cliente selecionada (da página anterior) ou escolha manual
-cliente_padrao = st.session_state.get("cliente")
-if not cliente_padrao:
-    cliente_padrao = df["Cliente"].dropna().astype(str).sort_values().unique().tolist()[0]
+# ---------- Lista ÚNICA de clientes ----------
+# Mapa chave -> label (primeira ocorrência)
+label_por_key = (
+    df.drop_duplicates("ClienteKey")[["ClienteKey", "ClienteLabel"]]
+      .set_index("ClienteKey")["ClienteLabel"]
+      .to_dict()
+)
 
-cliente = st.selectbox("👤 Cliente", sorted(df["Cliente"].dropna().astype(str).unique()), index=None, placeholder=cliente_padrao)
-if cliente is None:
-    cliente = cliente_padrao
+# Ordenar por label
+opcoes_keys = sorted(label_por_key.keys(), key=lambda k: label_por_key[k])
 
-# Filtro cliente
-dados_cli = df[df["Cliente"] == cliente].copy()
-dados_cli.sort_values("Data", inplace=True)
+# Pré-seleção vinda da página anterior
+pre = st.session_state.get("cliente")
+pre_key = None
+if pre:
+    pre_key = str(pre).strip().lower()
+    if pre_key not in label_por_key:
+        pre_key = None
 
-# Indicadores simples
-total = dados_cli["ValorNum"].sum()
-visitas = dados_cli["Data"].dt.date.nunique()
+# Selectbox usando a KEY como valor e LABEL como exibição
+st.subheader("👤 Cliente")
+cliente_key = st.selectbox(
+    "Cliente",
+    options=opcoes_keys,
+    index=(opcoes_keys.index(pre_key) if pre_key in opcoes_keys else 0) if opcoes_keys else None,
+    format_func=lambda k: label_por_key.get(k, k.title()),
+    placeholder="Selecione a cliente",
+)
+
+# Filtra os dados pela chave única
+dados_cli = df[df["ClienteKey"] == cliente_key].copy().sort_values("Data")
+cliente_label = label_por_key.get(cliente_key, cliente_key.title())
+
+# ---------- Indicadores ----------
+total = float(dados_cli["ValorNum"].sum())
+visitas = int(dados_cli["Data"].dt.date.nunique())
 ticket_medio = dados_cli.groupby(dados_cli["Data"].dt.date)["ValorNum"].sum().mean()
-ticket_medio = 0 if pd.isna(ticket_medio) else ticket_medio
+ticket_medio = 0.0 if pd.isna(ticket_medio) else float(ticket_medio)
 
 col1, col2, col3 = st.columns(3)
 col1.metric("💰 Receita total", f"R$ {total:,.2f}".replace(",", "v").replace(".", ",").replace("v","."))
-col2.metric("🗓️ Visitas (dias distintos)", int(visitas))
+col2.metric("🗓️ Visitas (dias distintos)", visitas)
 col3.metric("🧾 Tíquete médio", f"R$ {ticket_medio:,.2f}".replace(",", "v").replace(".", ",").replace("v","."))
 
-# Gráfico mensal
-mensal = dados_cli.resample("M", on="Data")["ValorNum"].sum().reset_index()
+# ---------- Gráfico mensal ----------
+mensal = (dados_cli.resample("M", on="Data")["ValorNum"].sum()
+          .reset_index().rename(columns={"ValorNum":"Receita"}))
 mensal["Mês"] = mensal["Data"].dt.strftime("%b/%Y")
-fig = px.bar(mensal, x="Mês", y="ValorNum", text=mensal["ValorNum"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v",".")),
-             labels={"ValorNum":"Receita (R$)"}, template="plotly_dark", height=380)
+
+fig = px.bar(
+    mensal, x="Mês", y="Receita",
+    text=mensal["Receita"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v",".")),
+    labels={"Receita": "Receita (R$)"},
+    template="plotly_dark", height=380, title=f"Receita mensal — {cliente_label}"
+)
 fig.update_traces(textposition="outside", cliponaxis=False)
 fig.update_layout(showlegend=False)
 st.plotly_chart(fig, use_container_width=True)
 
-# Tabela de serviços
+# ---------- Serviços ----------
 if "Serviço" in dados_cli.columns:
     tb = (dados_cli.groupby("Serviço")["ValorNum"].sum()
           .reset_index().sort_values("ValorNum", ascending=False))
@@ -155,16 +199,16 @@ if "Serviço" in dados_cli.columns:
     st.markdown("**Serviços realizados**")
     st.dataframe(tb[["Serviço","Valor"]], use_container_width=True)
 
-# Histórico detalhado
-hist = dados_cli[["Data","Serviço","Conta","ValorNum"]].copy() if "Serviço" in dados_cli.columns else dados_cli[["Data","Conta","ValorNum"]].copy()
-hist.rename(columns={"ValorNum":"Valor"}, inplace=True)
+# ---------- Histórico detalhado ----------
+cols = ["Data","Serviço","Conta","ValorNum"] if "Serviço" in dados_cli.columns else ["Data","Conta","ValorNum"]
+hist = dados_cli[cols].copy().rename(columns={"ValorNum":"Valor"})
 hist["Valor"] = hist["Valor"].apply(lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v","."))
 hist.sort_values("Data", ascending=False, inplace=True)
 st.markdown("**Histórico**")
 st.dataframe(hist, use_container_width=True)
 
-# Status atual (se existir na planilha de status feminino)
+# ---------- Status atual ----------
 if not df_status.empty:
-    status_atual = df_status.loc[df_status["Cliente"] == cliente, "Status"]
+    status_atual = df_status.loc[df_status["ClienteKey"] == cliente_key, "Status"]
     if not status_atual.empty:
         st.info(f"📌 Status atual no cadastro: **{status_atual.iloc[0]}**")
