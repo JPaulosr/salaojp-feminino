@@ -32,16 +32,31 @@ def norm(s: str) -> str:
     return " ".join(s.lower().strip().split())
 
 def parse_valor_qualquer(v):
+    """Converte 'R$ 1.234,56', '1.234,56', '25,00', '25.00', '25.0' ou número em float (sem inflar)."""
     if pd.isna(v): return 0.0
-    s = str(v).strip()
-    if not s: return 0.0
-    s = (s.replace("R$", "").replace("r$", "").replace(" ", "")
-           .replace(".", "").replace("\u00A0", ""))
-    s = s.replace(",", ".")
+    if isinstance(v, (int, float)):  # já é número
+        return float(v)
+
+    s = str(v).strip().replace("\u00A0", "")
+    s = s.replace("R$", "").replace("r$", "").replace(" ", "")
+
+    tem_virg = "," in s
+    tem_ponto = "." in s
+
+    if tem_virg and tem_ponto:
+        # PT-BR: milhar '.' e decimal ','
+        s = s.replace(".", "").replace(",", ".")
+    elif tem_virg and not tem_ponto:
+        # Só vírgula -> é decimal
+        s = s.replace(",", ".")
+    else:
+        # Só ponto (ou nenhum) -> ponto é decimal. NÃO remover (evita 25.0 -> 250).
+        pass
+
     try:
         return float(s)
     except Exception:
-        x = pd.to_numeric(v, errors="coerce")
+        x = pd.to_numeric(s, errors="coerce")
         return float(x) if pd.notna(x) else 0.0
 
 def achar_col(df, nomes):
@@ -146,7 +161,6 @@ def atualizar_status_clientes_batch(status_map: dict) -> int:
     planilha = conectar_sheets()
     ws = find_worksheet(planilha, [norm(x) for x in STATUS_ALVOS])
 
-    # Lê todos os valores (inclui cabeçalho)
     vals = ws.get_all_values()   # [[Cliente, Status, ...], ...]
     if not vals:
         return 0
@@ -156,10 +170,9 @@ def atualizar_status_clientes_batch(status_map: dict) -> int:
         cli_idx0 = header.index("Cliente")         # 0-based
         sta_idx0 = header.index("Status")
     except ValueError:
-        # fallback esperto (primeiras duas colunas)
-        cli_idx0, sta_idx0 = 0, 1
+        cli_idx0, sta_idx0 = 0, 1  # fallback
 
-    linhas = vals[1:]  # sem header
+    linhas = vals[1:]
     novos_status = []
     alterados = 0
 
@@ -177,7 +190,6 @@ def atualizar_status_clientes_batch(status_map: dict) -> int:
     fim = len(vals)
     rng = f"{col_letra}{inicio}:{col_letra}{fim}"
 
-    # ÚNICA requisição de escrita:
     ws.update(rng, novos_status, value_input_option="RAW")
     return alterados
 
@@ -186,6 +198,13 @@ def atualizar_status_clientes_batch(status_map: dict) -> int:
 # =============================
 df = carregar_dados()
 df_status = carregar_status_df()
+
+# Botão para recarregar caches rapidamente (opcional)
+with st.expander("⚙️ Opções"):
+    if st.button("♻️ Recarregar dados (limpar cache)"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.experimental_rerun()
 
 # Mascara FIADO (não entra em receita)
 if "Conta" in df.columns:
@@ -212,8 +231,7 @@ if st.button("🔄 Atualizar status agora"):
             st.success(f"✅ {alterados} linha(s) de status atualizadas em lote.")
         else:
             st.info("Nenhuma linha precisava de atualização.")
-        # Recarrega cache de status para refletir na tela
-        st.cache_data.clear()   # limpa caches de dados
+        st.cache_data.clear()
         df_status = carregar_status_df()
     except Exception as e:
         st.warning(f"⚠️ Erro ao atualizar status: {e}")
@@ -258,7 +276,7 @@ top5 = ranking.head(5)
 fig_top = px.bar(
     top5, x="Cliente", y="Valor",
     text=top5["Valor"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v", ".")),
-    labels={"Valor": "Receita (R$)"}, color="Cliente", template="plotly_white", height=400
+    labels={"Valor": "Receita (R$)"}, color="Cliente", template="plotly_dark", height=400
 )
 fig_top.update_traces(textposition="outside", cliponaxis=False)
 fig_top.update_layout(showlegend=False)
@@ -313,7 +331,7 @@ if not df_fiado.empty:
     fig_fiado = px.bar(
         top_fiado, x="Cliente", y="ValorNum", text=top_fiado["Valor Formatado"],
         labels={"ValorNum": "Fiado (R$)"}, color="Cliente",
-        template="plotly_white", height=380
+        template="plotly_dark", height=380
     )
     fig_fiado.update_traces(textposition="outside", cliponaxis=False)
     fig_fiado.update_layout(showlegend=False)
