@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.express as px
 from babel.dates import format_date
 import gspread
-from gspread_dataframe import get_as_dataframe
+from gspread_dataframe import get_as_dataframe  # (mantido caso use no futuro)
 from google.oauth2.service_account import Credentials
 import unicodedata
 import requests
@@ -132,7 +132,7 @@ def carregar_dados():
 df = carregar_dados()
 
 # ========================
-# SELECT DE CLIENTE (sem duplicatas) + FOTO ABAIXO DO NOME
+# SELECT DE CLIENTE + NOME EM DESTAQUE + FOTO LOGO ABAIXO
 # ========================
 labels_por_key = (
     df.drop_duplicates("ClienteKey")[["ClienteKey", "ClienteLabel"]]
@@ -141,13 +141,13 @@ labels_por_key = (
 opcoes_keys = sorted(labels_por_key.keys(), key=lambda k: labels_por_key[k])
 
 pre = st.session_state.get("cliente")
-pre_key = str(pre).strip().lower() if pre else None  # corrigido (.lower(), não .str.lower())
+pre_key = str(pre).strip().lower() if pre else None
 if pre_key not in labels_por_key:
     pre_key = None
 
 st.subheader("👤 Cliente")
 cliente_key = st.selectbox(
-    "Cliente",
+    "Selecione o cliente para detalhamento",
     options=opcoes_keys,
     index=(opcoes_keys.index(pre_key) if (pre_key and pre_key in opcoes_keys) else 0) if opcoes_keys else None,
     format_func=lambda k: labels_por_key.get(k, k.title()),
@@ -155,7 +155,8 @@ cliente_key = st.selectbox(
 
 cliente_label = labels_por_key.get(cliente_key, cliente_key.title())
 
-# >>> FOTO logo abaixo do nome
+# ——— Nome em destaque e foto logo abaixo ———
+st.markdown(f"## {cliente_label}")
 if "Foto" in df.columns:
     foto_urls = (
         df.loc[df["ClienteKey"] == cliente_key, "Foto"]
@@ -166,12 +167,12 @@ if "Foto" in df.columns:
             resp = requests.get(foto_urls[0], timeout=8)
             resp.raise_for_status()
             img = Image.open(BytesIO(resp.content))
-            st.image(img, caption=cliente_label, width=240)
+            st.image(img, caption=None, width=260)  # foto logo abaixo do nome
         except Exception:
             st.info("Não foi possível carregar a foto. Verifique o link/permissões.")
     else:
         st.info("Nenhuma foto cadastrada para esta cliente.")
-# <<< FOTO
+# ————————————————————————————————
 
 dados_cli_all = df[df["ClienteKey"] == cliente_key].copy()
 
@@ -199,7 +200,7 @@ col3.metric("🧾 Tíquete médio", moeda(ticket_medio))
 col4.metric("📌 Fiado no filtro", moeda(fiado_total))
 
 # ========================
-# RECEITA MENSAL (pt-BR em ordem cronológica)
+# RECEITA MENSAL
 # ========================
 if dados_cli.empty:
     st.info("Sem registros para esta combinação de cliente + forma de pagamento.")
