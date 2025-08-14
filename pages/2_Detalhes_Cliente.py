@@ -1,4 +1,3 @@
-# pages/2F_DetalhesCliente.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -7,6 +6,7 @@ import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 import unicodedata
+from datetime import datetime
 
 st.set_page_config(layout="wide")
 st.title("💅 Detalhes da Cliente (Feminino)")
@@ -19,287 +19,137 @@ BASE_ALVOS = [
     "base de dados feminino", "base de dados - feminino",
     "base de dados (feminino)", "base de dados feminino "
 ]
-STATUS_ALVOS = [
-    "clientes_status_feminino", "clientes status feminino",
-    "clientes_status feminino", "status_feminino"
-]
-
-# Logo padrão quando não houver foto válida
-FOTO_PADRAO = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
 
 # ========================
 # UTILS
 # ========================
 def parse_valor(v):
-    if pd.isna(v): return 0.0
-    if isinstance(v, (int, float)): return float(v)
-    s = str(v).strip().replace("\u00A0", "")
-    s = s.replace("R$", "").replace("r$", "").replace(" ", "")
-    tem_virg = "," in s
-    tem_ponto = "." in s
-    if tem_virg and tem_ponto:
-        s = s.replace(".", "").replace(",", ".")
-    elif tem_virg and not tem_ponto:
-        s = s.replace(",", ".")
+    """Converte valores para float"""
+    if pd.isna(v):
+        return 0.0
     try:
-        return float(s)
-    except Exception:
-        x = pd.to_numeric(s, errors="coerce")
-        return float(x) if pd.notna(x) else 0.0
+        v = str(v).replace("R$", "").replace(".", "").replace(",", ".").strip()
+        return float(v)
+    except:
+        return 0.0
 
 def moeda(v):
-    return f"R$ {float(v):,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    try:
+        return f"R$ {float(v):,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    except:
+        return "R$ 0,00"
 
-def norm_ws(s: str) -> str:
-    if s is None: return ""
-    s = str(s)
-    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
-    return " ".join(s.lower().strip().split())
+def normalize_text(text):
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', str(text))
+        if unicodedata.category(c) != 'Mn'
+    ).lower().strip()
 
-def achar_col(df, nomes):
-    alvo = [n.strip().lower() for n in nomes]
-    for c in df.columns:
-        if c.strip().lower() in alvo:
-            return c
-    return None
-
-def find_worksheet(sh, alvos_norm):
-    wss = sh.worksheets()
-    titulos = [ws.title for ws in wss]
-    tnorms  = [norm_ws(t) for t in titulos]
-    for ws, t in zip(wss, tnorms):
-        if t in alvos_norm:  # match exato
-            return ws
-    for ws, t in zip(wss, tnorms):
-        if any(a in t for a in alvos_norm):  # contém
-            return ws
-    st.error("❌ Não encontrei a aba feminina. Guias disponíveis:\n- " + "\n- ".join(titulos))
-    st.stop()
-
-# ========================
-# CONEXÃO
-# ========================
-@st.cache_resource
-def conectar_sheets():
-    info = st.secrets["GCP_SERVICE_ACCOUNT"]
-    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    cred = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(cred).open_by_key(SHEET_ID)
-
-# ========================
-# CARREGAR DADOS
-# ========================
 @st.cache_data(ttl=300)
 def carregar_dados():
-    sh = conectar_sheets()
-    ws = find_worksheet(sh, [norm_ws(x) for x in BASE_ALVOS])
-    gid = ws.id
-    csv_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
-    df = pd.read_csv(csv_url)
-
-    df.columns = [c.strip() for c in df.columns]
-
-    if "Data" not in df.columns:
-        st.error("A aba feminina precisa ter a coluna 'Data'."); st.stop()
-    df["Data"] = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
-    df = df.dropna(subset=["Data"]).copy()
-    df["Ano"] = df["Data"].dt.year.astype(int)
-    df["MesNum"] = df["Data"].dt.month
-    df["MesNome"] = df["Data"].dt.to_period("M").dt.to_timestamp().apply(
-        lambda x: format_date(x, "MMMM", locale="pt_BR").title()
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive"]
     )
+    gc = gspread.authorize(creds)
+    planilha = gc.open_by_key(SHEET_ID)
+    abas = [s.title for s in planilha.worksheets()]
 
-    if "Serviço" not in df.columns and "Servico" in df.columns:
-        df.rename(columns={"Servico": "Serviço"}, inplace=True)
+    aba_encontrada = None
+    for alvo in BASE_ALVOS:
+        for nome_aba in abas:
+            if normalize_text(nome_aba) == normalize_text(alvo):
+                aba_encontrada = nome_aba
+                break
+        if aba_encontrada:
+            break
 
-    if "Valor" not in df.columns:
-        st.error("A aba feminina precisa ter a coluna 'Valor'."); st.stop()
-    df["ValorNum"] = df["Valor"].apply(parse_valor)
-
-    if "Conta" not in df.columns:
-        df["Conta"] = "Indefinido"
-    df["Conta"] = df["Conta"].fillna("Indefinido").astype(str).str.strip().str.title()
-
-    if "Cliente" not in df.columns:
-        st.error("A aba feminina precisa ter a coluna 'Cliente'."); st.stop()
-    df["ClienteRaw"]   = df["Cliente"].astype(str)
-    df["ClienteKey"]   = df["ClienteRaw"].str.strip().str.lower()
-    df["ClienteLabel"] = df["ClienteRaw"].str.strip().str.title()
-
-    # Foto na própria base (opcional)
-    possiveis_col_foto = ["Foto", "Imagem", "Link Imagem", "Link", "URL", "Foto URL", "Imagem URL", "Foto_Url"]
-    col_foto_base = achar_col(df, possiveis_col_foto)
-
-    ban = {"boliviano", "brasileiro", "menino", "menino boliviano"}
-    df = df[~df["ClienteKey"].isin(ban)]
-
-    return df, col_foto_base
-
-@st.cache_data(ttl=300)
-def carregar_status():
-    try:
-        sh = conectar_sheets()
-        ws = find_worksheet(sh, [norm_ws(x) for x in STATUS_ALVOS])
-        df = get_as_dataframe(ws).dropna(how="all")
-        df.columns = [c.strip() for c in df.columns]
-        if "Cliente" not in df.columns:
-            return pd.DataFrame()
-        df["ClienteKey"] = df["Cliente"].astype(str).str.strip().str.lower()
-        possiveis_col_foto = ["Foto", "Imagem", "Link Imagem", "Link", "URL", "Foto URL", "Imagem URL", "Foto_Url"]
-        col_foto = achar_col(df, possiveis_col_foto)
-        if not col_foto:
-            return pd.DataFrame()
-        df["FotoURL"] = df[col_foto].astype(str).str.strip()
-        return df[["ClienteKey", "FotoURL"]].dropna()
-    except Exception:
+    if not aba_encontrada:
+        st.error("Aba 'Base de Dados Feminino' não encontrada.")
         return pd.DataFrame()
 
-df, col_foto_base = carregar_dados()
-df_status = carregar_status()
+    ws = planilha.worksheet(aba_encontrada)
+    df = get_as_dataframe(ws, evaluate_formulas=True)
+    df = df.dropna(how="all")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 # ========================
-# SELECT DE CLIENTE
+# CARREGA DADOS
 # ========================
-labels_por_key = (
-    df.drop_duplicates("ClienteKey")[["ClienteKey", "ClienteLabel"]]
-      .set_index("ClienteKey")["ClienteLabel"].to_dict()
+df = carregar_dados()
+if df.empty:
+    st.stop()
+
+df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
+df["ValorNum"] = df["Valor"].apply(parse_valor)
+
+# ========================
+# FILTRO DE CLIENTE
+# ========================
+clientes = sorted(df["Cliente"].dropna().unique())
+cliente_sel = st.selectbox("Selecione a cliente", clientes)
+
+# Mantém ano atual por padrão mesmo após reload
+ano_atual = datetime.now().year
+if "ano_selecionado" not in st.session_state:
+    st.session_state["ano_selecionado"] = ano_atual
+
+anos = sorted(df["Data"].dt.year.dropna().unique(), reverse=True)
+ano_sel = st.selectbox(
+    "Selecione o ano",
+    anos,
+    index=anos.index(st.session_state["ano_selecionado"]) if st.session_state["ano_selecionado"] in anos else 0
 )
-opcoes_keys = sorted(labels_por_key.keys(), key=lambda k: labels_por_key[k])
-
-pre = st.session_state.get("cliente")
-pre_key = str(pre).strip().lower() if pre else None
-if pre_key not in labels_por_key:
-    pre_key = None
-
-st.subheader("👤 Cliente")
-cliente_key = st.selectbox(
-    "Cliente",
-    options=opcoes_keys,
-    index=(opcoes_keys.index(pre_key) if pre_key in opcoes_keys else 0) if opcoes_keys else None,
-    format_func=lambda k: labels_por_key.get(k, k.title()),
-)
-cliente_label = labels_por_key.get(cliente_key, cliente_key.title())
-dados_cli_all = df[df["ClienteKey"] == cliente_key].copy()
+st.session_state["ano_selecionado"] = ano_sel
 
 # ========================
-# FOTO DA CLIENTE (abaixo do nome)
+# FILTRAR DADOS
 # ========================
-def url_valida(u: str) -> bool:
-    if not u: return False
-    s = str(u).strip()
-    if s.lower() in {"nan", "none", "null", "0"}: return False
-    return s.lower().startswith(("http://", "https://"))
-
-foto_url = None
-if not df_status.empty:
-    mapa_foto = dict(zip(df_status["ClienteKey"], df_status["FotoURL"]))
-    foto_url = mapa_foto.get(cliente_key)
-
-if (not url_valida(foto_url)) and col_foto_base:
-    serie = dados_cli_all[col_foto_base].dropna().astype(str).str.strip()
-    if len(serie):
-        candidato = serie.iloc[0]
-        if url_valida(candidato):
-            foto_url = candidato
-
-if not url_valida(foto_url):
-    foto_url = FOTO_PADRAO
-
-st.image(foto_url, caption=cliente_label, use_container_width=False, width=220)
+dados_cli = df[(df["Cliente"] == cliente_sel) & (df["Data"].dt.year == ano_sel)].copy()
 
 # ========================
-# FILTRO: ANO e MÊS
+# GRÁFICO RECEITA MENSAL
 # ========================
-st.subheader("📅 Filtros de período")
-anos_disp = sorted(dados_cli_all["Ano"].unique().tolist())
-ano_atual = pd.Timestamp.today().year
-if ano_atual not in anos_disp:
-    anos_disp.append(ano_atual)
-    anos_disp = sorted(anos_disp)
-
-if "ano_cli_sel" not in st.session_state:
-    st.session_state["ano_cli_sel"] = ano_atual if ano_atual in anos_disp else anos_disp[-1]
-
-ano_sel = st.selectbox("Ano", ["Todos"] + anos_disp, index=(["Todos"] + anos_disp).index(st.session_state["ano_cli_sel"]))
-st.session_state["ano_cli_sel"] = ano_sel
-
-if ano_sel == "Todos":
-    base_periodo = dados_cli_all.copy()
-else:
-    base_periodo = dados_cli_all[dados_cli_all["Ano"] == ano_sel].copy()
-
-meses_ordem = (base_periodo
-               .drop_duplicates(["MesNum", "MesNome"])
-               .sort_values("MesNum"))
-mes_opcoes = ["Todos"] + meses_ordem["MesNome"].tolist()
-
-if "mes_cli_sel" not in st.session_state or st.session_state["mes_cli_sel"] not in mes_opcoes:
-    st.session_state["mes_cli_sel"] = "Todos"
-
-mes_sel = st.selectbox("Mês", mes_opcoes, index=mes_opcoes.index(st.session_state["mes_cli_sel"]))
-st.session_state["mes_cli_sel"] = mes_sel
-
-dados_cli = base_periodo.copy()
-if mes_sel != "Todos":
-    dados_cli = dados_cli[dados_cli["MesNome"] == mes_sel]
+receita_mes = dados_cli.groupby(dados_cli["Data"].dt.month)["ValorNum"].sum().reset_index()
+receita_mes.columns = ["MêsNum", "Valor"]
+receita_mes["Mês"] = receita_mes["MêsNum"].apply(lambda x: format_date(datetime(ano_sel, x, 1), "MMMM", locale="pt_BR").title())
+fig = px.bar(receita_mes, x="Mês", y="Valor", text=receita_mes["Valor"].apply(moeda),
+             title=f"Receita Mensal - {ano_sel}", template="plotly_white")
+st.plotly_chart(fig, use_container_width=True)
 
 # ========================
-# MÉTRICAS
+# SERVIÇOS (no período)
 # ========================
-col1, col2, col3, col4 = st.columns(4)
-total = float(dados_cli["ValorNum"].sum())
-visitas = int(dados_cli["Data"].dt.date.nunique())
-ticket_medio = dados_cli.groupby(dados_cli["Data"].dt.date)["ValorNum"].sum().mean()
-ticket_medio = 0.0 if pd.isna(ticket_medio) else float(ticket_medio)
-fiado_total = float(dados_cli[dados_cli["Conta"].str.lower()=="fiado"]["ValorNum"].sum())
-
-col1.metric("💰 Receita total (período)", moeda(total))
-col2.metric("🗓️ Visitas (dias distintos)", visitas)
-col3.metric("🧾 Tíquete médio", moeda(ticket_medio))
-col4.metric("📌 Fiado no período", moeda(fiado_total))
-
-# ========================
-# RECEITA MENSAL
-# ========================
-if dados_cli.empty:
-    st.info("Sem registros para esta combinação de cliente + período.")
-else:
-    mensal = (
-        dados_cli
-        .assign(YM=dados_cli["Data"].dt.to_period("M"))
-        .groupby("YM", as_index=False)["ValorNum"].sum()
-        .rename(columns={"ValorNum": "Receita"})
-        .sort_values("YM")
+if "Serviço" in dados_cli.columns:
+    serv = (
+        dados_cli.groupby("Serviço")["ValorNum"].sum()
+        .reset_index().sort_values("ValorNum", ascending=False)
     )
-    mensal["MesAno"] = mensal["YM"].dt.to_timestamp().apply(
-        lambda x: format_date(x, "MMMM yyyy", locale="pt_BR").title()
-    )
+    serv["Valor"] = serv["ValorNum"].apply(moeda)
+    st.markdown("**Serviços realizados (no período)**")
+    st.dataframe(serv[["Serviço", "Valor"]], use_container_width=True)
 
-    fig = px.bar(
-        mensal,
-        x="MesAno", y="Receita",
-        text=mensal["Receita"].apply(lambda v: moeda(v).replace(",00", "")),
-        labels={"Receita": "Receita (R$)", "MesAno": "Mês"},
-        template="plotly_dark",
-        title=f"📅 Receita mensal — {cliente_label}",
-        height=380,
-    )
-    fig.update_traces(textposition="outside", cliponaxis=False)
-    fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+# ========================
+# DETALHES (no período) — Data em dd/mm/aaaa
+# ========================
+cols = ["Data", "Serviço", "Conta", "ValorNum"] if "Serviço" in dados_cli.columns else ["Data", "Conta", "ValorNum"]
+hist = dados_cli[cols].copy().rename(columns={"ValorNum": "Valor"})
 
-    # ========================
-    # SERVIÇOS (no período)
-    # ========================
-    if "Serviço" in dados_cli.columns:
-        serv = (
-            dados_cli.groupby("Serviço")["ValorNum"].sum()
-            .reset_index().sort_values("ValorNum", ascending=False)
-        )
-        serv["Valor"] = serv["ValorNum"].apply(moeda)
-        st.markdown("**Serviços realizados (no período)**")
-        st.dataframe(serv[["Serviço", "Valor"]], use_container_width=True)
+# Formatações
+hist["Data"] = pd.to_datetime(hist["Data"], errors="coerce")
+hist["DataBR"] = hist["Data"].dt.strftime("%d/%m/%Y")
+hist["Valor"] = hist["Valor"].apply(moeda)
+hist["Mês"] = hist["Data"].apply(lambda x: format_date(x, "MMMM yyyy", locale="pt_BR").title())
 
-   hist = dados_cli[cols].copy().rename(columns={"ValorNum": "Valor"})
-    st.markdown("**Histórico de atendimentos (no período)**")
-    st.dataframe(hist[exibir_cols].reset_index(drop=True), use_container_width=True)
+# Ordena e renomeia DataBR -> Data para exibir
+hist.sort_values("Data", ascending=False, inplace=True)
+hist.rename(columns={"DataBR": "Data"}, inplace=True)
+
+# Exibe apenas colunas existentes (evita KeyError)
+ordem_desejada = ["Data", "Serviço", "Conta", "Valor", "Mês"]
+exibir_cols = [c for c in ordem_desejada if c in hist.columns]
+
+st.markdown("**Histórico de atendimentos (no período)**")
+st.dataframe(hist[exibir_cols].reset_index(drop=True), use_container_width=True)
