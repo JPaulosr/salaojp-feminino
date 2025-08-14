@@ -8,8 +8,8 @@ from google.oauth2.service_account import Credentials
 import cloudinary
 import cloudinary.uploader
 
-st.set_page_config(page_title="Galeria de Clientes", layout="wide")
-st.title("🌞 Galeria de Clientes")
+st.set_page_config(page_title="Galeria de Clientes Feminino", layout="wide")
+st.title("💅 Galeria de Clientes (Feminino)")
 
 # === LOGO PADRÃO ===
 LOGO_PADRAO = "https://res.cloudinary.com/db8ipmete/image/upload/v1752708088/Imagem_do_WhatsApp_de_2025-07-16_%C3%A0_s_11.20.50_cbeb2873_nlhddx.jpg"
@@ -30,7 +30,8 @@ def carregar_dados():
         )
         cliente = gspread.authorize(credenciais)
         planilha = cliente.open_by_url(st.secrets["PLANILHA_URL"])
-        aba = planilha.worksheet("clientes_status")
+        # ⬇️ Alterado para ler a aba feminina
+        aba = planilha.worksheet("clientes_status_feminino")
         dados = aba.get_all_records()
         return pd.DataFrame(dados), aba
     except Exception as e:
