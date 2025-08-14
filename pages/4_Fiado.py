@@ -3,6 +3,8 @@
 # Controle de Fiado — Meire (Feminino)
 #   ✓ Usa service account de st.secrets["GCP_SERVICE_ACCOUNT"] OU ["gcp_service_account"]
 #   ✓ Se não houver credenciais: leitura via CSV (sem escrita)
+#   ✓ Datas estáveis: Data/Fiado_Vencimento/Quitado_em salvas como DD/MM/YYYY (texto)
+#     e colunas auxiliares *_dt para cálculos/filtragem
 # --------------------------------------------------------------
 
 import streamlit as st
@@ -25,7 +27,7 @@ st.set_page_config(page_title="Fiado (Meire - Feminino)", page_icon="💳", layo
 st.title("💳 Controle de Fiado — Registro da Meire (Feminino)")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
 
-# ID padrão (sua planilha principal)
+# ID padrão (planilha principal)
 SHEET_ID_PADRAO = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 SHEET_ID_MEIRE = st.secrets.get("SHEET_ID_MEIRE", SHEET_ID_PADRAO)
 PLANILHA_URL_MEIRE = f"https://docs.google.com/spreadsheets/d/{SHEET_ID_MEIRE}/edit"
@@ -40,8 +42,8 @@ ABA_FEMININO_ALVOS = [
 
 # ===== NOVO: compatível com [GCP_SERVICE_ACCOUNT] e [gcp_service_account]
 def _get_service_account_from_secrets():
-    """Retorna o dict do JSON da service account a partir dos secrets, aceitando
-    tanto 'GCP_SERVICE_ACCOUNT' (maiúsculas) quanto 'gcp_service_account' (minúsculas)."""
+    """Retorna o dict do JSON da service account a partir dos secrets,
+    aceitando 'GCP_SERVICE_ACCOUNT' (maiúsculas) e 'gcp_service_account' (minúsculas)."""
     svc = st.secrets.get("gcp_service_account")
     if not svc:
         svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
@@ -70,22 +72,63 @@ def moeda_to_float(v):
     except Exception:
         return 0.0
 
+def _parse_date_br(x):
+    try:
+        return pd.to_datetime(x, dayfirst=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+def _fmt_ddmmyyyy(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    # já é date?
+    try:
+        import datetime as _dt
+        if isinstance(x, _dt.date):
+            return x.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    try:
+        ts = pd.to_datetime(x, dayfirst=True, errors="coerce")
+        if pd.isna(ts):
+            # mantém o texto original se não converter
+            return str(x)
+        return ts.strftime("%d/%m/%Y")
+    except Exception:
+        return str(x)
+
 def normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
+    # remove colunas Unnamed
     df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")].copy()
+
+    # garante colunas obrigatórias (sem mexer na 'Data' original)
     for c in COLS_OBRIGATORIAS:
         if c not in df.columns:
             df[c] = "" if c != "Valor" else 0.0
+
+    # Valor numérico
     if "Valor" in df.columns:
         df["Valor"] = df["Valor"].apply(moeda_to_float)
+
+    # Colunas auxiliares para cálculo/filtragem
     if "Data" in df.columns:
-        df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
+        df["Data_dt"] = df["Data"].apply(_parse_date_br)
     if "Fiado_Vencimento" in df.columns:
-        df["Fiado_Vencimento"] = pd.to_datetime(df["Fiado_Vencimento"], errors="coerce").dt.date
+        df["Venc_dt"] = df["Fiado_Vencimento"].apply(_parse_date_br)
     if "Quitado_em" in df.columns:
-        df["Quitado_em"] = pd.to_datetime(df["Quitado_em"], errors="coerce").dt.date
+        df["Quitado_dt"] = df["Quitado_em"].apply(_parse_date_br)
+
+    # limpa linhas totalmente vazias (NÃO remover se tiver Data preenchida)
     if len(df):
-        empty_mask = df.fillna("").astype(str).apply(lambda r: "".join(r.values), axis=1) == ""
-        df = df.loc[~empty_mask].copy()
+        def _is_row_empty(row):
+            r = row.fillna("")
+            if str(r.get("Data", "")).strip() != "":
+                return False
+            cols_check = [c for c in df.columns if not c.endswith("_dt")]
+            return "".join([str(r[c]) for c in cols_check]).strip() == ""
+        mask_empty = df.apply(_is_row_empty, axis=1)
+        df = df.loc[~mask_empty].copy()
+
     return df
 
 # ===== Caminho 1: com autenticação (le/escreve)
@@ -120,8 +163,23 @@ def carregar_df_auth(ws) -> pd.DataFrame:
     return normalizar_df(df)
 
 def salvar_df_auth(ws, df: pd.DataFrame):
+    # Antes de salvar, formatar colunas de data como texto DD/MM/YYYY
+    df = df.copy()
+
+    if "Data" in df.columns:
+        df["Data"] = df["Data"].apply(_fmt_ddmmyyyy)
+    if "Fiado_Vencimento" in df.columns:
+        df["Fiado_Vencimento"] = df["Fiado_Vencimento"].apply(_fmt_ddmmyyyy)
+    if "Quitado_em" in df.columns:
+        df["Quitado_em"] = df["Quitado_em"].apply(_fmt_ddmmyyyy)
+
+    # não levar colunas auxiliares *_dt para a planilha
+    df = df.loc[:, [c for c in df.columns if not c.endswith("_dt")]]
+
+    # garantir colunas obrigatórias
     cols = list(dict.fromkeys(list(df.columns) + COLS_OBRIGATORIAS))
     df = df.reindex(columns=cols)
+
     set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
 # ===== Caminho 2: sem autenticação (leitura CSV)
@@ -150,7 +208,7 @@ def carregar_df_sem_auth() -> tuple[pd.DataFrame, str]:
 # ===== Carregar dados
 HAS_AUTH = _tem_auth()
 if not HAS_AUTH:
-    st.warning("Sem credenciais: modo leitura via CSV (sem escrita). Para editar, mantenha seus secrets como [GCP_SERVICE_ACCOUNT].")
+    st.warning("Sem credenciais: modo leitura via CSV (sem escrita). Para editar, mantenha seus secrets como [GCP_SERVICE_ACCOUNT] ou [gcp_service_account].")
 
 if HAS_AUTH:
     sh, ws, abas_disp, aba_usada = abrir_planilha_com_auth(SHEET_ID_MEIRE)
@@ -221,15 +279,28 @@ if modo.startswith("➕"):
                 st.error("Informe um combo OU selecione um serviço."); st.stop()
             linhas.append({"Serviço": servico_sel, "Valor": moeda_to_float(valor_unico), "Combo": ""})
 
+        # montar novas linhas (datas como TEXTO DD/MM/YYYY)
         novos = []
         for L in linhas:
             novos.append({
-                "Data": data_atend, "Serviço": L["Serviço"], "Valor": L["Valor"], "Conta": conta,
-                "Cliente": cliente, "Combo": L["Combo"], "Funcionário": funcionario,
-                "Fase": fase, "Tipo": tipo, "Período": (periodo if periodo != "—" else ""),
-                "Fiado_Vencimento": venc_opc, "Fiado_Status": "Em aberto", "Quitado_em": "", "Observação": observ
+                "Data": data_atend.strftime("%d/%m/%Y"),
+                "Serviço": L["Serviço"],
+                "Valor": L["Valor"],
+                "Conta": conta,
+                "Cliente": cliente,
+                "Combo": L["Combo"],
+                "Funcionário": funcionario,
+                "Fase": fase,
+                "Tipo": tipo,
+                "Período": (periodo if periodo != "—" else ""),
+                "Fiado_Vencimento": (venc_opc.strftime("%d/%m/%Y") if venc_opc else ""),
+                "Fiado_Status": "Em aberto",
+                "Quitado_em": "",
+                "Observação": observ
             })
         df_novos = pd.DataFrame(novos)
+
+        # anexa e salva
         df_final = pd.concat([df_base, df_novos], ignore_index=True)
         salvar_df_auth(ws, df_final)
         st.success(f"Fiado lançado com sucesso para **{cliente}** ({len(df_novos)} linha(s)).")
@@ -260,13 +331,13 @@ elif modo.startswith("💵"):
 
         hoje = date.today()
         if filtro_vencidos:
-            venc = pd.to_datetime(df_base["Fiado_Vencimento"], errors="coerce").dt.date
-            mask &= (venc.notna() & (venc < hoje))
+            venc = df_base.get("Venc_dt")
+            mask &= (venc.notna() & (venc.dt.date < hoje))
             if incluir_sem_venc:
                 mask |= ((df_base["Cliente"].astype(str) == cliente_pg) &
                          (df_base["Conta"].astype(str).str.lower() == "fiado") &
                          (df_base["Fiado_Status"].astype(str).str.lower().isin(["", "em aberto"])) &
-                         venc.isna())
+                         (venc.isna()))
 
         df_aberto = df_base[mask].copy()
         st.markdown(f"**Fiados em aberto para {cliente_pg}: {len(df_aberto)}**")
@@ -282,7 +353,7 @@ elif modo.startswith("💵"):
                 idxs = df_aberto.index
                 for idx in idxs:
                     df_edit.loc[idx, "Fiado_Status"] = "Pago"
-                    df_edit.loc[idx, "Quitado_em"] = data_quit
+                    df_edit.loc[idx, "Quitado_em"] = data_quit.strftime("%d/%m/%Y")
                     df_edit.loc[idx, "Conta"] = forma
                 salvar_df_auth(ws, df_edit)
                 st.success(f"Quitado com sucesso: {len(idxs)} linha(s) de {cliente_pg}.")
@@ -309,8 +380,8 @@ else:
     if periodo_f != "—":
         df_em_aberto = df_em_aberto[df_em_aberto["Período"] == periodo_f]
     if venc_ate:
-        vencs = pd.to_datetime(df_em_aberto["Fiado_Vencimento"], errors="coerce").dt.date
-        df_em_aberto = df_em_aberto[vencs.notna() & (vencs <= venc_ate)]
+        vencs = df_em_aberto.get("Venc_dt")
+        df_em_aberto = df_em_aberto[vencs.notna() & (vencs.dt.date <= venc_ate)]
 
     total_aberto = df_em_aberto["Valor"].apply(moeda_to_float).sum() if len(df_em_aberto) else 0.0
     st.metric("Total em aberto (R$)", f"{total_aberto:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
@@ -318,7 +389,7 @@ else:
     cols_show = ["Data","Cliente","Serviço","Valor","Fiado_Vencimento","Período","Observação"]
     cols_show = [c for c in cols_show if c in df_em_aberto.columns]
     st.dataframe(
-        df_em_aberto[cols_show].sort_values(by=["Cliente","Data"], ascending=[True, True]).reset_index(drop=True),
+        df_em_aberto[cols_show].sort_values(by=["Cliente","Data_dt"], ascending=[True, True]).reset_index(drop=True),
         use_container_width=True
     )
 
