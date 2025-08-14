@@ -300,23 +300,6 @@ else:
         st.markdown("**Serviços realizados (no período)**")
         st.dataframe(serv[["Serviço", "Valor"]], use_container_width=True)
 
-    # ========================
-    # DETALHES (no período) — Data em dd/mm/aaaa
-    # ========================
-    cols = ["Data", "Serviço", "Conta", "ValorNum"] if "Serviço" in dados_cli.columns else ["Data", "Conta", "ValorNum"]
-    hist = dados_cli[cols].copy().rename(columns={"ValorNum": "Valor"})
-
-    # NOVO: coluna de data formatada BR
-    hist["Data"] = pd.to_datetime(hist["Data"], errors="coerce")
-    hist["DataBR"] = hist["Data"].dt.strftime("%d/%m/%Y")
-
-    hist["Valor"] = hist["Valor"].apply(moeda)
-    hist["Mês"] = hist["Data"].apply(lambda x: format_date(x, "MMMM yyyy", locale="pt_BR").title())
-
-    # Ordena do mais recente e reordena colunas (mostrando DataBR em vez do datetime cru)
-    exibir_cols = ["DataBR"] + ([ "Serviço"] if "Serviço" in hist.columns else []) + ["Conta", "Valor", "Mês"]
-    hist = hist.sort_values("Data", ascending=False)
-    hist.rename(columns={"DataBR": "Data"}, inplace=True)
-
+   hist = dados_cli[cols].copy().rename(columns={"ValorNum": "Valor"})
     st.markdown("**Histórico de atendimentos (no período)**")
     st.dataframe(hist[exibir_cols].reset_index(drop=True), use_container_width=True)
