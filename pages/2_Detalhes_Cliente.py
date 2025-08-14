@@ -307,24 +307,30 @@ else:
         st.dataframe(serv[["Serviço", "Valor"]], use_container_width=True)
 
     # ========================
-    # DETALHES (no período) — Data em dd/mm/aaaa
-    # ========================
-    cols = ["Data", "Serviço", "Conta", "ValorNum"] if "Serviço" in dados_cli.columns else ["Data", "Conta", "ValorNum"]
-    hist = dados_cli[cols].copy().rename(columns={"ValorNum": "Valor"})
+# DETALHES (no período) — Data em dd/mm/aaaa (FIX duplicatas)
+# ========================
+cols = ["Data", "Serviço", "Conta", "ValorNum"] if "Serviço" in dados_cli.columns else ["Data", "Conta", "ValorNum"]
+hist = dados_cli[cols].copy().rename(columns={"ValorNum": "Valor"})
 
-    # Formatações
-    hist["Data"] = pd.to_datetime(hist["Data"], errors="coerce")
-    hist["DataBR"] = hist["Data"].dt.strftime("%d/%m/%Y")
-    hist["Valor"] = hist["Valor"].apply(moeda)
-    hist["Mês"] = hist["Data"].apply(lambda x: format_date(x, "MMMM yyyy", locale="pt_BR").title())
+# Converte e guarda datetime em coluna auxiliar
+hist["_DataDT"] = pd.to_datetime(hist["Data"], errors="coerce")
 
-    # Ordena e renomeia DataBR -> Data para exibir
-    hist.sort_values("Data", ascending=False, inplace=True)
-    hist.rename(columns={"DataBR": "Data"}, inplace=True)
+# Coluna Mês (pt-BR)
+hist["Mês"] = hist["_DataDT"].apply(lambda x: format_date(x, "MMMM yyyy", locale="pt_BR").title())
 
-    # Exibe apenas colunas existentes (evita KeyError)
-    ordem_desejada = ["Data", "Serviço", "Conta", "Valor", "Mês"]
-    exibir_cols = [c for c in ordem_desejada if c in hist.columns]
+# Sobrescreve a própria 'Data' com formato brasileiro (sem criar outra coluna)
+hist["Data"] = hist["_DataDT"].dt.strftime("%d/%m/%Y")
 
-    st.markdown("**Histórico de atendimentos (no período)**")
-    st.dataframe(hist[exibir_cols].reset_index(drop=True), use_container_width=True)
+# Formata valor
+hist["Valor"] = hist["Valor"].apply(moeda)
+
+# Ordena pelo datetime real e remove a auxiliar
+hist.sort_values("_DataDT", ascending=False, inplace=True)
+hist.drop(columns=["_DataDT"], inplace=True)
+
+# Garante a ordem e só exibe colunas que existem (evita KeyError se 'Serviço' não existir)
+ordem_desejada = ["Data", "Serviço", "Conta", "Valor", "Mês"]
+exibir_cols = [c for c in ordem_desejada if c in hist.columns]
+
+st.markdown("**Histórico de atendimentos (no período)**")
+st.dataframe(hist[exibir_cols].reset_index(drop=True), use_container_width=True)
