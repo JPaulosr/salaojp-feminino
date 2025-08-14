@@ -341,4 +341,3 @@ else:
         if st.button("➕ Novo Atendimento"):
             st.session_state.simples_salvo_fem = False
             st.rerun()
-
