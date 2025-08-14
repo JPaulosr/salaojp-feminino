@@ -1,8 +1,8 @@
 # pages/12_Fiado_Meire.py
 # --------------------------------------------------------------
 # Controle de Fiado — Meire (Feminino)
-#   ✓ Se houver st.secrets["gcp_service_account"] => leitura e escrita (Google Sheets via gspread)
-#   ✓ Se NÃO houver => fallback leitura via CSV público; escrita é desativada
+#   ✓ Usa service account de st.secrets["GCP_SERVICE_ACCOUNT"] OU ["gcp_service_account"]
+#   ✓ Se não houver credenciais: leitura via CSV (sem escrita)
 # --------------------------------------------------------------
 
 import streamlit as st
@@ -12,7 +12,7 @@ from io import BytesIO
 import pytz
 import urllib.parse
 
-# Tente importar gspread apenas quando for usar auth
+# gspread e auth (opcionais; só serão usados se houver credenciais)
 try:
     import gspread
     from gspread_dataframe import get_as_dataframe, set_with_dataframe
@@ -21,7 +21,6 @@ except Exception:
     gspread = None
     Credentials = None
 
-# ============== CONFIG GERAL ==============
 st.set_page_config(page_title="Fiado (Meire - Feminino)", page_icon="💳", layout="wide")
 st.title("💳 Controle de Fiado — Registro da Meire (Feminino)")
 BR_TZ = pytz.timezone("America/Sao_Paulo")
@@ -31,7 +30,6 @@ SHEET_ID_PADRAO = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 SHEET_ID_MEIRE = st.secrets.get("SHEET_ID_MEIRE", SHEET_ID_PADRAO)
 PLANILHA_URL_MEIRE = f"https://docs.google.com/spreadsheets/d/{SHEET_ID_MEIRE}/edit"
 
-# Abas possíveis da base feminina (tentamos nessa ordem)
 ABA_FEMININO_ALVOS = [
     "Base de Dados Feminino",
     "base de dados feminino",
@@ -40,20 +38,19 @@ ABA_FEMININO_ALVOS = [
     "Base de Dados Fem",
 ]
 
-# ============== AVISOS INICIAIS ==============
-if "SHEET_ID_MEIRE" not in st.secrets:
-    st.warning("Usando ID/URL **padrão** definidos no código (SHEET_ID_MEIRE/PLANILHA_URL_MEIRE não encontrados em secrets).")
+# ===== NOVO: compatível com [GCP_SERVICE_ACCOUNT] e [gcp_service_account]
+def _get_service_account_from_secrets():
+    """Retorna o dict do JSON da service account a partir dos secrets, aceitando
+    tanto 'GCP_SERVICE_ACCOUNT' (maiúsculas) quanto 'gcp_service_account' (minúsculas)."""
+    svc = st.secrets.get("gcp_service_account")
+    if not svc:
+        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
+    return svc
 
-HAS_AUTH = False
-if "gcp_service_account" in st.secrets:
-    HAS_AUTH = True
-else:
-    st.error(
-        "Service Account **não configurada** em `st.secrets['gcp_service_account']`. "
-        "Habilitei **modo leitura** via CSV público (sem escrita)."
-    )
+def _tem_auth():
+    return _get_service_account_from_secrets() is not None and Credentials is not None and gspread is not None
 
-# ============== HELPERS COMUNS ==============
+# ===== Helpers comuns
 COLS_OBRIGATORIAS = [
     "Data", "Serviço", "Valor", "Conta", "Cliente", "Combo",
     "Funcionário", "Fase", "Tipo", "Período",
@@ -74,32 +71,31 @@ def moeda_to_float(v):
         return 0.0
 
 def normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
-    # remove colunas Unnamed
     df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")].copy()
-    # garantir colunas
     for c in COLS_OBRIGATORIAS:
         if c not in df.columns:
             df[c] = "" if c != "Valor" else 0.0
-    # tipos
     if "Valor" in df.columns:
         df["Valor"] = df["Valor"].apply(moeda_to_float)
-    # datas
     if "Data" in df.columns:
         df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
     if "Fiado_Vencimento" in df.columns:
         df["Fiado_Vencimento"] = pd.to_datetime(df["Fiado_Vencimento"], errors="coerce").dt.date
     if "Quitado_em" in df.columns:
         df["Quitado_em"] = pd.to_datetime(df["Quitado_em"], errors="coerce").dt.date
-    # limpa linhas totalmente vazias
     if len(df):
         empty_mask = df.fillna("").astype(str).apply(lambda r: "".join(r.values), axis=1) == ""
         df = df.loc[~empty_mask].copy()
     return df
 
-# ============== CAMINHO 1: COM AUTENTICAÇÃO (LE/ESCREVE) ==============
+# ===== Caminho 1: com autenticação (le/escreve)
 def abrir_planilha_com_auth(spreadsheet_id: str):
+    svc = _get_service_account_from_secrets()
+    if not svc:
+        st.error("Credenciais não encontradas em st.secrets['gcp_service_account'] nem ['GCP_SERVICE_ACCOUNT'].")
+        st.stop()
     creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
+        svc,
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
@@ -107,7 +103,6 @@ def abrir_planilha_com_auth(spreadsheet_id: str):
     )
     client = gspread.authorize(creds)
     sh = client.open_by_key(spreadsheet_id)
-    # encontrar aba feminina
     abas = [ws.title for ws in sh.worksheets()]
     alvo = None
     for possivel in ABA_FEMININO_ALVOS:
@@ -115,7 +110,6 @@ def abrir_planilha_com_auth(spreadsheet_id: str):
             alvo = possivel
             break
     if alvo is None:
-        # fallback: primeira aba
         alvo = abas[0]
         st.warning(f"Não encontrei uma aba Feminino esperada. Usando a primeira aba: {alvo}")
     ws = sh.worksheet(alvo)
@@ -130,15 +124,13 @@ def salvar_df_auth(ws, df: pd.DataFrame):
     df = df.reindex(columns=cols)
     set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
-# ============== CAMINHO 2: SEM AUTENTICAÇÃO (LEITURA CSV) ==============
-def tentar_csv(sheet_name: str) -> pd.DataFrame | None:
-    # monta URL CSV da aba
+# ===== Caminho 2: sem autenticação (leitura CSV)
+def _csv_from_sheet(sheet_name: str) -> pd.DataFrame | None:
     quoted = urllib.parse.quote(sheet_name, safe="")
     url_csv = f"https://docs.google.com/spreadsheets/d/{SHEET_ID_MEIRE}/gviz/tq?tqx=out:csv&sheet={quoted}"
     try:
         df = pd.read_csv(url_csv)
         if len(df.columns) == 1 and df.columns[0].startswith("<!DOCTYPE html"):
-            # resposta de erro típica quando a aba não existe/é privada
             return None
         return df
     except Exception:
@@ -146,42 +138,41 @@ def tentar_csv(sheet_name: str) -> pd.DataFrame | None:
 
 def carregar_df_sem_auth() -> tuple[pd.DataFrame, str]:
     for nome in ABA_FEMININO_ALVOS:
-        df = tentar_csv(nome)
-        if df is not None and len(df) >= 0:
+        df = _csv_from_sheet(nome)
+        if df is not None:
             return normalizar_df(df), nome
-    # último esforço: sheet sem nome específico (pode falhar)
-    df = tentar_csv("Base%20de%20Dados")
+    df = _csv_from_sheet("Base%20de%20Dados")  # último esforço
     if df is not None:
         return normalizar_df(df), "Base de Dados"
-    st.error(
-        "Não consegui ler a planilha via CSV público. "
-        "Verifique se a planilha está **Compartilhada com link** (leitura)."
-    )
+    st.error("Não consegui ler a planilha via CSV público. Verifique se a planilha está compartilhada (leitura).")
     st.stop()
 
-# ============== CARREGAR DADOS ==============
+# ===== Carregar dados
+HAS_AUTH = _tem_auth()
+if not HAS_AUTH:
+    st.warning("Sem credenciais: modo leitura via CSV (sem escrita). Para editar, mantenha seus secrets como [GCP_SERVICE_ACCOUNT].")
+
 if HAS_AUTH:
     sh, ws, abas_disp, aba_usada = abrir_planilha_com_auth(SHEET_ID_MEIRE)
-    st.success(f"Conectado com autenticação. Aba usada: **{aba_usada}**")
+    st.success(f"Conectado com autenticação. Aba: **{aba_usada}**")
     st.caption(f"Abas disponíveis: {', '.join(abas_disp)}")
     df_base = carregar_df_auth(ws)
     EDITAVEL = True
 else:
     df_base, aba_usada = carregar_df_sem_auth()
-    st.info(f"Conectado em **modo leitura** via CSV. Aba usada: **{aba_usada}**")
+    st.info(f"Conectado em **modo leitura** via CSV. Aba: **{aba_usada}**")
     EDITAVEL = False
 
-# ============== OPÇÕES DINÂMICAS ==============
+# ===== Opções dinâmicas
 clientes_opts = sorted([c for c in df_base["Cliente"].dropna().unique() if str(c).strip()])
 servicos_opts = sorted([s for s in df_base["Serviço"].dropna().unique() if str(s).strip()])
-combos_opts = sorted([c for c in df_base["Combo"].dropna().unique() if str(c).strip()])
+periodos_opts = sorted([p for p in df_base.get("Período", pd.Series([])).dropna().unique() if str(p).strip()])
 formas_pagamento = sorted(
     [c for c in df_base.get("Conta", pd.Series([])).dropna().unique() if str(c).strip()]
     + ["Carteira", "Pix", "Nubank", "Dinheiro", "Cartão"]
 )
-periodos_opts = sorted([p for p in df_base.get("Período", pd.Series([])).dropna().unique() if str(p).strip()])
 
-# ============== SIDEBAR ==============
+# ===== Sidebar
 st.sidebar.header("Ações")
 modo = st.sidebar.radio(
     "Escolha:",
@@ -189,11 +180,12 @@ modo = st.sidebar.radio(
     index=0
 )
 
-# ============== UI: LANÇAR FIADO ==============
+# ===== Lançar fiado
 if modo.startswith("➕"):
     st.subheader("Lançar fiado — cria UMA linha por serviço (Conta='Fiado')")
     if not EDITAVEL:
-        st.warning("Modo leitura: **lançar fiado desativado**. Configure `gcp_service_account` para habilitar escrita.")
+        st.warning("Modo leitura: lançar fiado desativado. Configure as credenciais em [GCP_SERVICE_ACCOUNT] ou [gcp_service_account].")
+
     colA, colB = st.columns([1,1])
     with colA:
         data_atend = st.date_input("Data do atendimento", value=date.today(), disabled=not EDITAVEL)
@@ -209,62 +201,45 @@ if modo.startswith("➕"):
         periodo = st.selectbox("Período (opcional)", options=["—"] + periodos_opts, index=0, disabled=not EDITAVEL)
         observ = st.text_area("Observação (opcional)", "", disabled=not EDITAVEL)
 
-    funcionario = "Meire"
-    conta = "Fiado"
+    funcionario = "Meire"; conta = "Fiado"
 
     if st.button("Salvar fiado", type="primary", disabled=not EDITAVEL):
-        # valida cliente
         cliente = cliente_sel if cliente_sel != "—" else cliente_digitado.strip()
         if not cliente:
-            st.error("Informe o cliente (selecione ou digite).")
-            st.stop()
+            st.error("Informe o cliente (selecione ou digite)."); st.stop()
 
         linhas = []
         if combo_txt.strip():
             partes = [p.strip() for p in combo_txt.split("+") if p.strip()]
             if not partes:
-                st.error("Combo informado está vazio depois de separar por '+'.")
-                st.stop()
+                st.error("Combo informado está vazio depois de separar por '+'."); st.stop()
             valores = [moeda_to_float(valor_unico)] + [0.0]*(len(partes)-1)
             for i, srv in enumerate(partes):
                 linhas.append({"Serviço": srv, "Valor": valores[i], "Combo": combo_txt})
         else:
             if servico_sel == "—":
-                st.error("Informe um combo OU selecione um serviço.")
-                st.stop()
+                st.error("Informe um combo OU selecione um serviço."); st.stop()
             linhas.append({"Serviço": servico_sel, "Valor": moeda_to_float(valor_unico), "Combo": ""})
 
         novos = []
         for L in linhas:
             novos.append({
-                "Data": data_atend,
-                "Serviço": L["Serviço"],
-                "Valor": L["Valor"],
-                "Conta": conta,
-                "Cliente": cliente,
-                "Combo": L["Combo"],
-                "Funcionário": funcionario,
-                "Fase": fase,
-                "Tipo": tipo,
-                "Período": (periodo if periodo != "—" else ""),
-                "Fiado_Vencimento": venc_opc,
-                "Fiado_Status": "Em aberto",
-                "Quitado_em": "",
-                "Observação": observ
+                "Data": data_atend, "Serviço": L["Serviço"], "Valor": L["Valor"], "Conta": conta,
+                "Cliente": cliente, "Combo": L["Combo"], "Funcionário": funcionario,
+                "Fase": fase, "Tipo": tipo, "Período": (periodo if periodo != "—" else ""),
+                "Fiado_Vencimento": venc_opc, "Fiado_Status": "Em aberto", "Quitado_em": "", "Observação": observ
             })
         df_novos = pd.DataFrame(novos)
-
-        # anexa e salva
         df_final = pd.concat([df_base, df_novos], ignore_index=True)
-        salvar_df_auth(ws, df_final)   # só chega aqui se EDITAVEL=True
+        salvar_df_auth(ws, df_final)
         st.success(f"Fiado lançado com sucesso para **{cliente}** ({len(df_novos)} linha(s)).")
         st.balloons()
 
-# ============== UI: REGISTRAR PAGAMENTO ==============
+# ===== Registrar pagamento
 elif modo.startswith("💵"):
     st.subheader("Registrar pagamento (quitar por competência)")
     if not EDITAVEL:
-        st.warning("Modo leitura: **quitação desativada**. Configure `gcp_service_account` para habilitar escrita.")
+        st.warning("Modo leitura: quitação desativada. Configure as credenciais em [GCP_SERVICE_ACCOUNT] ou [gcp_service_account].")
 
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
@@ -309,11 +284,11 @@ elif modo.startswith("💵"):
                     df_edit.loc[idx, "Fiado_Status"] = "Pago"
                     df_edit.loc[idx, "Quitado_em"] = data_quit
                     df_edit.loc[idx, "Conta"] = forma
-                salvar_df_auth(ws, df_edit)  # só chega aqui se EDITAVEL=True
+                salvar_df_auth(ws, df_edit)
                 st.success(f"Quitado com sucesso: {len(idxs)} linha(s) de {cliente_pg}.")
                 st.balloons()
 
-# ============== UI: EM ABERTO & EXPORTAÇÃO ==============
+# ===== Em aberto & Exportação
 else:
     st.subheader("Fiados em aberto")
 
@@ -347,7 +322,6 @@ else:
         use_container_width=True
     )
 
-    # Exportar Excel
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df_em_aberto.to_excel(writer, index=False, sheet_name="Fiado_Em_Aberto")
@@ -358,6 +332,4 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# Rodapé
-modo_txt = "Edição habilitada (auth)" if HAS_AUTH else "Somente leitura (CSV)"
-st.caption(f"{modo_txt} · Planilha: {PLANILHA_URL_MEIRE} · Aba: {aba_usada}")
+st.caption(f"{'Edição habilitada (auth)' if HAS_AUTH else 'Somente leitura (CSV)'} · Planilha: {PLANILHA_URL_MEIRE} · Aba: {aba_usada}")
