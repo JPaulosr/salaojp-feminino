@@ -37,11 +37,7 @@ def _strip2d(rows):
 
 def _coerce_valor(series: pd.Series) -> pd.Series:
     """
-    Converte valores vindos como:
-      - número (25, 25.0)
-      - texto BR (R$ 1.234,56)
-      - texto US (1234.56)
-    Sem estourar os valores (não remove ponto decimal legítimo).
+    Converte: número, 'R$ 1.234,56', '1234.56' etc.
     """
     def parse_cell(x):
         if pd.isna(x):
@@ -52,23 +48,15 @@ def _coerce_valor(series: pd.Series) -> pd.Series:
         if not s:
             return 0.0
         s = s.replace("R$", "").replace(" ", "")
-
-        # Caso BR: tem vírgula como decimal
-        if "," in s:
-            # remove pontos de milhar e troca vírgula por ponto (decimal)
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
+        if "," in s:                     # formato BR
+            s = s.replace(".", "")       # remove milhar
+            s = s.replace(",", ".")      # vírgula -> decimal
             return pd.to_numeric(s, errors="coerce")
-
-        # Caso sem vírgula:
-        # - Se houver mais de um ponto, último é decimal e os anteriores são milhar
-        if s.count(".") > 1:
+        if s.count(".") > 1:             # vários pontos: último = decimal
             left, last = s.rsplit(".", 1)
             left = left.replace(".", "")
             s = f"{left}.{last}"
-
         return pd.to_numeric(s, errors="coerce")
-
     return series.map(parse_cell).fillna(0.0)
 
 def _parse_data_sheets(col: pd.Series) -> pd.Series:
@@ -109,17 +97,41 @@ def carregar_base_feminina() -> pd.DataFrame:
         df = df.dropna(subset=["Data"])
         df["Ano"] = df["Data"].dt.year.astype(int)
         df["Mês"] = df["Data"].dt.month.astype(int)
+        df["Dia"] = df["Data"].dt.date  # para deduplicar por dia
     else:
         df["Ano"] = pd.NA
         df["Mês"] = pd.NA
+        df["Dia"] = pd.NA
 
     # Normaliza "Funcionário"
     col_func = [c for c in df.columns if c.lower() in ["funcionário","funcionario"]]
     if col_func:
         df.rename(columns={col_func[0]: "Funcionário"}, inplace=True)
 
+    # Normaliza "Cliente"
+    if "Cliente" in df.columns:
+        df["Cliente"] = df["Cliente"].astype(str).str.strip()
+    else:
+        df["Cliente"] = ""
+
     return df
 
+# === Contagem de atendimentos por Cliente+Data (regra única no feminino) ===
+def total_atendimentos_unicos(df: pd.DataFrame) -> int:
+    pares = (df.loc[df["Cliente"].ne(""), ["Cliente", "Dia"]]
+               .dropna()
+               .drop_duplicates())
+    return int(len(pares))
+
+def atendimentos_por_cliente(df: pd.DataFrame) -> pd.Series:
+    pares = (df.loc[df["Cliente"].ne(""), ["Cliente", "Dia"]]
+               .dropna()
+               .drop_duplicates())
+    return pares.groupby("Cliente").size().astype(int)
+
+# =========================
+# CARREGA BASE
+# =========================
 df = carregar_base_feminina()
 if df.empty:
     st.warning("Sem dados na aba **Base de Dados Feminino**.")
@@ -157,14 +169,11 @@ mask_fiado = base[col_conta].astype(str).str.strip().str.lower().eq("fiado") if 
 base_rec = base[~mask_fiado].copy()
 
 # =========================
-# INDICADORES
+# INDICADORES (Cliente+Data em todo o período)
 # =========================
 receita_total = float(base_rec["ValorNum"].sum())
-total_atend   = len(base)
-data_limite = pd.to_datetime("2025-05-11")
-antes  = base[base["Data"] < data_limite]
-depois = base[base["Data"] >= data_limite].drop_duplicates(subset=["Cliente","Data"])
-clientes_unicos = pd.concat([antes, depois])["Cliente"].nunique()
+total_atend   = total_atendimentos_unicos(base)                 # <<< regra aplicada
+clientes_ativos = base.loc[base["Cliente"].ne(""), "Cliente"].nunique()
 ticket = receita_total/total_atend if total_atend else 0.0
 
 def brl(x: float) -> str:
@@ -174,7 +183,7 @@ c1,c2,c3,c4 = st.columns(4)
 c1.metric("💰 Receita Total", brl(receita_total))
 c2.metric("📅 Total de Atendimentos", int(total_atend))
 c3.metric("🎯 Ticket Médio", brl(ticket))
-c4.metric("🟢 Clientes Ativos", int(clientes_unicos))
+c4.metric("🟢 Clientes Ativos", int(clientes_ativos))
 
 # =========================
 # 📆 Receita Mensal
@@ -207,14 +216,24 @@ else:
     st.info("A coluna **Funcionário** não existe na base.")
 
 # =========================
-# 🥇 Top 10 Clientes
+# 🥇 Top 10 Clientes — usando Qtd_Atendimentos por Cliente+Data
 # =========================
 st.markdown("### 🥇 Top 10 Clientes (Feminino)")
 nomes_excluir = ["boliviano","brasileiro","menino"]
-cnt = base.groupby("Cliente")["Serviço"].count().rename("Qtd_Serviços") if "Serviço" in base.columns else pd.Series(dtype=int)
-val = base_rec.groupby("Cliente")["ValorNum"].sum().rename("Valor") if "ValorNum" in base_rec.columns else pd.Series(dtype=float)
-df_top = pd.concat([cnt,val], axis=1).reset_index().fillna(0)
+
+qtd_atend = atendimentos_por_cliente(base)                  # <<< regra aplicada
+val_por_cliente = base_rec.groupby("Cliente")["ValorNum"].sum()
+
+df_top = pd.concat(
+    [qtd_atend.rename("Qtd_Atendimentos"), val_por_cliente.rename("Valor")],
+    axis=1
+).fillna(0).reset_index()
+
+df_top = df_top[df_top["Cliente"].astype(str).str.strip() != ""]
 df_top = df_top[~df_top["Cliente"].str.lower().isin(nomes_excluir)]
-df_top = df_top.sort_values("Valor", ascending=False).head(10)
+df_top = df_top.sort_values(["Valor","Qtd_Atendimentos"], ascending=False).head(10)
 df_top["Valor Formatado"] = df_top["Valor"].apply(brl)
-st.dataframe(df_top[["Cliente","Qtd_Serviços","Valor Formatado"]], use_container_width=True)
+
+st.dataframe(df_top[["Cliente","Qtd_Atendimentos","Valor Formatado"]], use_container_width=True)
+
+st.caption("ℹ️ **Regra**: *Total de Atendimentos* e *Qtd_Atendimentos* contam **1 por Cliente + Data** (combos em várias linhas valem 1).")
