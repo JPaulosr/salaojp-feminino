@@ -34,7 +34,7 @@ def norm(s: str) -> str:
 def parse_valor_qualquer(v):
     """Converte 'R$ 1.234,56', '1.234,56', '25,00', '25.00', '25.0' ou número em float (sem inflar)."""
     if pd.isna(v): return 0.0
-    if isinstance(v, (int, float)):  # já é número
+    if isinstance(v, (int, float)):
         return float(v)
 
     s = str(v).strip().replace("\u00A0", "")
@@ -47,10 +47,10 @@ def parse_valor_qualquer(v):
         # PT-BR: milhar '.' e decimal ','
         s = s.replace(".", "").replace(",", ".")
     elif tem_virg and not tem_ponto:
-        # Só vírgula -> é decimal
+        # Só vírgula -> decimal
         s = s.replace(",", ".")
     else:
-        # Só ponto (ou nenhum) -> ponto é decimal. NÃO remover (evita 25.0 -> 250).
+        # Só ponto (ou nenhum) -> ponto é decimal
         pass
 
     try:
@@ -154,7 +154,7 @@ def carregar_status_df():
 
 def atualizar_status_clientes_batch(status_map: dict) -> int:
     """
-    Atualiza a coluna 'Status' da aba de status FEMININO em **uma única chamada**.
+    Atualiza a coluna 'Status' da aba FEMININO em **uma única chamada**.
     status_map: {nome_cliente: "Ativo"/"Inativo"}
     Retorna quantidade de linhas alteradas.
     """
@@ -184,6 +184,9 @@ def atualizar_status_clientes_batch(status_map: dict) -> int:
             alterados += 1
         novos_status.append([novo])
 
+    if alterados == 0:
+        return 0
+
     # Range de escrita: coluna Status da linha 2 até o fim
     col_letra = excel_col_letter(sta_idx0 + 1)  # idx 1-based
     inicio = 2
@@ -199,47 +202,70 @@ def atualizar_status_clientes_batch(status_map: dict) -> int:
 df = carregar_dados()
 df_status = carregar_status_df()
 
-# Botão para recarregar caches rapidamente (opcional)
-with st.expander("⚙️ Opções"):
-    if st.button("♻️ Recarregar dados (limpar cache)"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.experimental_rerun()
-
-# Mascara FIADO (não entra em receita)
-if "Conta" in df.columns:
-    mask_fiado = df["Conta"].fillna("").astype(str).str.strip().str.lower().eq("fiado")
-else:
-    mask_fiado = pd.Series(False, index=df.index)
-
-df_receita = df[~mask_fiado].copy()
-df_fiado = df[mask_fiado].copy()
-
-# Cálculo de status por recência (90 dias)
+# --- Status automático (sem botão) ---
 hoje = pd.Timestamp.today().normalize()
 ultimos = df.groupby("Cliente")["Data"].max().reset_index()
 ultimos["DiasDesde"] = (hoje - ultimos["Data"]).dt.days
 ultimos["StatusNovo"] = ultimos["DiasDesde"].apply(lambda x: "Inativo" if x > 90 else "Ativo")
 status_map = dict(zip(ultimos["Cliente"], ultimos["StatusNovo"]))
-
-# === Botão de atualização (grava 1x em lote) ===
-st.info("A atualização de status é feita **sob demanda** e usa **1 única gravação em lote**.")
-if st.button("🔄 Atualizar status agora"):
-    try:
-        alterados = atualizar_status_clientes_batch(status_map)
-        if alterados > 0:
-            st.success(f"✅ {alterados} linha(s) de status atualizadas em lote.")
-        else:
-            st.info("Nenhuma linha precisava de atualização.")
+try:
+    _alterados = atualizar_status_clientes_batch(status_map)
+    if _alterados > 0:
         st.cache_data.clear()
         df_status = carregar_status_df()
-    except Exception as e:
-        st.warning(f"⚠️ Erro ao atualizar status: {e}")
+except Exception:
+    pass
+
+# =============================
+# Filtro por Ano (mantém o ano atual e a última escolha)
+# =============================
+anos = sorted(df["Ano"].unique().tolist())
+ano_atual = pd.Timestamp.today().year
+# garante que o ano atual esteja na lista de opções
+if ano_atual not in anos:
+    anos.append(ano_atual)
+    anos = sorted(anos)
+
+opcoes_ano = ["Todos"] + anos
+
+# inicia sessão com ano atual no primeiro acesso
+if "ano_selecionado" not in st.session_state:
+    st.session_state["ano_selecionado"] = ano_atual
+
+# se a sessão tiver um valor que não existe nas opções, cai para ano atual
+valor_inicial = st.session_state["ano_selecionado"]
+if valor_inicial not in opcoes_ano:
+    valor_inicial = ano_atual
+
+ano_escolhido = st.selectbox(
+    "📅 Selecione o ano",
+    opcoes_ano,
+    index=opcoes_ano.index(valor_inicial)
+)
+# atualiza a sessão ao mudar
+st.session_state["ano_selecionado"] = ano_escolhido
+
+# =============================
+# Máscara FIADO e base filtrada por ano
+# =============================
+if "Conta" in df.columns:
+    mask_fiado_full = df["Conta"].fillna("").astype(str).str.strip().str.lower().eq("fiado")
+else:
+    mask_fiado_full = pd.Series(False, index=df.index)
+
+if ano_escolhido == "Todos":
+    df_base = df.copy()
+else:
+    df_base = df[df["Ano"] == ano_escolhido].copy()
+
+mask_fiado = mask_fiado_full.loc[df_base.index]
+df_receita = df_base[~mask_fiado].copy()
+df_fiado = df_base[mask_fiado].copy()
 
 # =============================
 # Indicadores
 # =============================
-clientes_unicos = df["Cliente"].nunique()
+clientes_unicos = df_base["Cliente"].nunique()
 contagem_status = df_status["Status"].value_counts().to_dict() if not df_status.empty else {}
 ativos = contagem_status.get("Ativo", 0)
 ignorados = contagem_status.get("Ignorado", 0)
@@ -254,10 +280,12 @@ c4.metric("🚩 Inativas", inativos)
 
 # Limpa nomes genéricos
 ban = {"boliviano", "brasileiro", "menino", "menino boliviano"}
-for _df in (df, df_receita, df_fiado):
+for _df in (df_base, df_receita, df_fiado):
     _df.drop(_df[_df["Cliente"].astype(str).str.lower().str.strip().isin(ban)].index, inplace=True)
 
-# Ranking
+# =============================
+# Receita total por cliente (ano filtrado)
+# =============================
 ranking = (df_receita.groupby("Cliente")["ValorNum"].sum()
            .reset_index().rename(columns={"ValorNum": "Valor"})
            .sort_values("Valor", ascending=False))
@@ -282,18 +310,51 @@ fig_top.update_traces(textposition="outside", cliponaxis=False)
 fig_top.update_layout(showlegend=False)
 st.plotly_chart(fig_top, use_container_width=True)
 
-# Comparativo
+# =============================
+# Resultado por cliente por ANO (sempre sem fiado)
+# =============================
+st.subheader("🗓️ Resultado por cliente por ano (sem fiado)")
+
+df_sem_fiado = df[~mask_fiado_full].copy()
+df_sem_fiado = df_sem_fiado[~df_sem_fiado["Cliente"].astype(str).str.lower().str.strip().isin(ban)]
+
+tabela_cliente_ano = (df_sem_fiado
+    .groupby(["Cliente", "Ano"])["ValorNum"].sum()
+    .reset_index()
+    .sort_values(["Cliente", "Ano"]))
+
+pivot_cliente_ano = tabela_cliente_ano.pivot(index="Cliente", columns="Ano", values="ValorNum").fillna(0.0)
+pivot_fmt = pivot_cliente_ano.applymap(lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
+
+st.dataframe(pivot_fmt, use_container_width=True)
+
+if not tabela_cliente_ano.empty:
+    st.markdown("**Evolução por ano (selecione uma cliente):**")
+    clientes_lista = sorted(tabela_cliente_ano["Cliente"].unique().tolist())
+    cliente_sel = st.selectbox("👤 Cliente", clientes_lista, index=0)
+    df_cli = tabela_cliente_ano[tabela_cliente_ano["Cliente"] == cliente_sel]
+    fig_cli = px.bar(
+        df_cli, x="Ano", y="ValorNum",
+        text=df_cli["ValorNum"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v", ".")),
+        labels={"ValorNum": "Receita (R$)"}, template="plotly_dark", height=380
+    )
+    fig_cli.update_traces(textposition="outside", cliponaxis=False)
+    st.plotly_chart(fig_cli, use_container_width=True)
+
+# =============================
+# Comparativo entre duas clientes (respeita filtro de ano)
+# =============================
 st.subheader("⚖️ Comparar duas clientes")
 if not ranking.empty:
     colA, colB = st.columns(2)
-    c1 = colA.selectbox("👤 Cliente 1", ranking["Cliente"].tolist())
+    c1_sel = colA.selectbox("👤 Cliente 1", ranking["Cliente"].tolist())
     idx2 = 1 if len(ranking) > 1 else 0
-    c2 = colB.selectbox("👤 Cliente 2", ranking["Cliente"].tolist(), index=idx2)
+    c2_sel = colB.selectbox("👤 Cliente 2", ranking["Cliente"].tolist(), index=idx2)
 
-    df_c1_val = df_receita[df_receita["Cliente"] == c1]
-    df_c2_val = df_receita[df_receita["Cliente"] == c2]
-    df_c1_hist = df[df["Cliente"] == c1]
-    df_c2_hist = df[df["Cliente"] == c2]
+    df_c1_val = df_receita[df_receita["Cliente"] == c1_sel]
+    df_c2_val = df_receita[df_receita["Cliente"] == c2_sel]
+    df_c1_hist = df_base[df_base["Cliente"] == c1_sel]
+    df_c2_hist = df_base[df_base["Cliente"] == c2_sel]
 
     def resumo_cliente(df_val, df_hist):
         total = df_val["ValorNum"].sum()
@@ -310,11 +371,13 @@ if not ranking.empty:
 
     r1, s1 = resumo_cliente(df_c1_val, df_c1_hist)
     r2, s2 = resumo_cliente(df_c2_val, df_c2_hist)
-    st.dataframe(pd.concat([r1.rename(c1), r2.rename(c2)], axis=1), use_container_width=True)
+    st.dataframe(pd.concat([r1.rename(c1_sel), r2.rename(c2_sel)], axis=1), use_container_width=True)
     st.markdown("**Serviços Realizados por Tipo**")
-    st.dataframe(pd.concat([s1.rename(c1), s2.rename(c2)], axis=1).fillna(0).astype(int), use_container_width=True)
+    st.dataframe(pd.concat([s1.rename(c1_sel), s2.rename(c2_sel)].copy(), axis=1).fillna(0).astype(int), use_container_width=True)
 
-# Fiados
+# =============================
+# Fiados (respeita filtro de ano)
+# =============================
 st.markdown("### 💳 Fiados — Resumo e Detalhes (Feminino)")
 total_fiado = df_fiado["ValorNum"].sum()
 colf1, colf2, colf3 = st.columns(3)
@@ -348,10 +411,12 @@ if not df_fiado.empty:
 else:
     st.info("Nenhum fiado em aberto encontrado para os filtros atuais (feminino).")
 
+# =============================
 # Navegar para detalhamento
+# =============================
 st.subheader("🔍 Ver detalhamento de uma cliente")
 if not ranking.empty:
     cliente_escolhido = st.selectbox("📌 Escolha uma cliente", ranking["Cliente"].tolist())
     if st.button("➡ Ver detalhes"):
         st.session_state["cliente"] = cliente_escolhido
-        st.switch_page("pages/2_DetalhesCliente.py")  # ajuste se tiver página específica feminina
+        st.switch_page("pages/2_DetalhesCliente.py")
