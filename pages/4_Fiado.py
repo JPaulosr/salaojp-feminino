@@ -1,380 +1,508 @@
-# pages/12_Fiado_Meire.py
-# --------------------------------------------------------------
-# Controle de Fiado — Meire (Feminino)
-# - Compatível com secrets: [GCP_SERVICE_ACCOUNT] ou [gcp_service_account]
-# - Auth (le/escreve) ou CSV (somente leitura)
-# - Datas sempre em DD/MM/YYYY (texto) e colunas auxiliares *_dt para filtros
-# - Padrão de colunas: StatusFiado, IDLancFiado, VencimentoFiado, DataPagamento
-#   + mantém colunas antigas equivalentes para compat (Fiado_Status, Fiado_Vencimento, Quitado_em)
-# - Gera IDLancFiado no formato L-YYYYMMDDHHMMSS-XXX (XXX = 3 dígitos)
-# --------------------------------------------------------------
+# -*- coding: utf-8 -*-
+# 12_Fiado_Feminino.py — Fiado integrado à Base (Feminino/Meire)
+# - Combo por linhas com valores editáveis
+# - Registrar pagamento por cliente (seleciona 1+ IDs; "selecionar todos")
+# - Sugere última forma de pagamento do cliente (vinda da Base Feminina)
+# - Quitar por COMPETÊNCIA (atualiza as linhas; não cria novas)
+# - Lançar comissão em "Despesas" no mesmo fluxo de quitação (opcional)
+# - Comissão usa a mesma data do fiado (se única); senão, cai na data do pagamento
+# - Exportação Excel (openpyxl) ou CSV (fallback)
+# - Sidebar expandida por padrão
 
 import streamlit as st
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from datetime import date, datetime
 from io import BytesIO
-import pytz, random, urllib.parse
+import pytz
 
-# gspread e auth (só usados se houver credenciais)
-try:
-    import gspread
-    from gspread_dataframe import get_as_dataframe, set_with_dataframe
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
+st.set_page_config(page_title="Fiado (Feminino | Meire)", page_icon="💳", layout="wide",
+                   initial_sidebar_state="expanded")
+st.title("💳 Controle de Fiado — Feminino (Meire)")
 
-st.set_page_config(page_title="Fiado (Meire - Feminino)", page_icon="💳", layout="wide")
-st.title("💳 Controle de Fiado — Registro da Meire (Feminino)")
-BR_TZ = pytz.timezone("America/Sao_Paulo")
+# ===== CONFIG =====
+SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
+ABA_BASE = "Base de Dados Feminino"
+ABA_LANC = "Fiado_Lancamentos_Fem"
+ABA_PAGT = "Fiado_Pagamentos_Fem"
+ABA_DESP = "Despesas"  # mesma aba de despesas da planilha
+TZ = pytz.timezone("America/Sao_Paulo")
+DATA_FMT = "%d/%m/%Y"
 
-# -------- Planilha alvo
-SHEET_ID_PADRAO = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
-SHEET_ID_MEIRE = st.secrets.get("SHEET_ID_MEIRE", SHEET_ID_PADRAO)
-PLANILHA_URL_MEIRE = f"https://docs.google.com/spreadsheets/d/{SHEET_ID_MEIRE}/edit"
+BASE_COLS_MIN = ["Data","Serviço","Valor","Conta","Cliente","Combo","Funcionário","Fase","Tipo","Período"]
+EXTRA_COLS    = ["StatusFiado","IDLancFiado","VencimentoFiado","DataPagamento"]
 
-# Abas possíveis
-ABA_FEMININO_ALVOS = [
-    "Base de Dados Feminino",
-    "base de dados feminino",
-    "base de dados - feminino",
-    "Base Feminino",
-    "Base de Dados Fem",
-]
+# valores padrão típicos do feminino (ajuste livre)
+VALORES_PADRAO = {
+    "Unha mão": 20.0,
+    "Unha Pé": 25.0,
+    "Sobrancelhas": 15.0,
+    "Escova": 25.0,
+    "Progressiva": 100.0,
+    "Progressiva (curta)": 75.0,
+    "Tinta": 20.0,
+    "Botox": 50.0,
+}
 
-# -------- Credenciais (aceita os dois nomes)
-def _get_service_account_from_secrets():
-    svc = st.secrets.get("gcp_service_account")
-    if not svc:
-        svc = st.secrets.get("GCP_SERVICE_ACCOUNT")
-    return svc
+# ===== Conexão =====
+@st.cache_resource
+def conectar_sheets():
+    info = st.secrets.get("GCP_SERVICE_ACCOUNT", st.secrets.get("gcp_service_account"))
+    scopes = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(SHEET_ID)
 
-def _tem_auth():
-    return _get_service_account_from_secrets() is not None and Credentials is not None and gspread is not None
-
-# -------- Colunas
-COLS_OBRIGATORIAS = [
-    # padrão comum da sua base
-    "Data","Serviço","Valor","Conta","Cliente","Combo","Funcionário","Fase","Tipo","Período",
-    # fiado (novo padrão)
-    "StatusFiado","IDLancFiado","VencimentoFiado","DataPagamento",
-    # fiado (antigo, mantido p/ compat)
-    "Fiado_Status","Fiado_Vencimento","Quitado_em",
-    # observação
-    "Observação",
-]
-
-# -------- Helpers
-def moeda_to_float(v):
-    if v is None or (isinstance(v, float) and pd.isna(v)): return 0.0
-    s = str(v).strip()
-    if s == "": return 0.0
-    s = s.replace("R$", "").replace(" ", "").replace(".", "").replace(",", ".")
-    try: return float(s)
-    except Exception: return 0.0
-
-def _parse_date_br(x):
-    try: return pd.to_datetime(x, dayfirst=True, errors="coerce")
-    except Exception: return pd.NaT
-
-def _fmt_ddmmyyyy(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)): return ""
+def garantir_aba(ss, nome, cols):
     try:
-        import datetime as _dt
-        if isinstance(x, _dt.date): return x.strftime("%d/%m/%Y")
-    except Exception: pass
-    try:
-        ts = pd.to_datetime(x, dayfirst=True, errors="coerce")
-        if pd.isna(ts): return str(x)
-        return ts.strftime("%d/%m/%Y")
-    except Exception:
-        return str(x)
+        ws = ss.worksheet(nome)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=nome, rows=200, cols=max(10, len(cols)))
+        ws.append_row(cols)
+        return ws
+    if not ws.row_values(1):
+        ws.append_row(cols)
+    return ws
 
-def _gen_lanc_id(prefix="L"):
-    now = datetime.now(BR_TZ)
-    return f"{prefix}-{now.strftime('%Y%m%d%H%M%S')}-{random.randint(100,999)}"
-
-def normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed")].copy()
-    # garantir colunas
-    for c in COLS_OBRIGATORIAS:
+def garantir_base_cols(ss):
+    ws = garantir_aba(ss, ABA_BASE, BASE_COLS_MIN + EXTRA_COLS)
+    df = get_as_dataframe(ws, evaluate_formulas=True, header=0).dropna(how="all")
+    for c in BASE_COLS_MIN + EXTRA_COLS:
         if c not in df.columns:
-            # valores default
-            df[c] = "" if c not in ["Valor"] else 0.0
+            df[c] = ""
+    df = df[[*BASE_COLS_MIN, *EXTRA_COLS, *[c for c in df.columns if c not in BASE_COLS_MIN+EXTRA_COLS]]]
+    ws.clear()
+    set_with_dataframe(ws, df)
+    return ws
 
-    # sincronizar nomes antigos/novos (sem sobrescrever o que já existe)
-    # Status
-    if df["StatusFiado"].eq("").all() and not df["Fiado_Status"].eq("").all():
-        df["StatusFiado"] = df["Fiado_Status"]
-    elif df["Fiado_Status"].eq("").all() and not df["StatusFiado"].eq("").all():
-        df["Fiado_Status"] = df["StatusFiado"]
-    # Vencimento
-    if df["VencimentoFiado"].eq("").all() and not df["Fiado_Vencimento"].eq("").all():
-        df["VencimentoFiado"] = df["Fiado_Vencimento"]
-    elif df["Fiado_Vencimento"].eq("").all() and not df["VencimentoFiado"].eq("").all():
-        df["Fiado_Vencimento"] = df["VencimentoFiado"]
-    # Pagamento
-    if df["DataPagamento"].eq("").all() and not df["Quitado_em"].eq("").all():
-        df["DataPagamento"] = df["Quitado_em"]
-    elif df["Quitado_em"].eq("").all() and not df["DataPagamento"].eq("").all():
-        df["Quitado_em"] = df["DataPagamento"]
+def garantir_aba_despesas(ss):
+    cols_min = ["Data","Prestador","Descrição","Valor","Forma de Pagamento"]
+    ws = garantir_aba(ss, ABA_DESP, cols_min)
+    headers = ws.row_values(1) or cols_min
+    return ws, headers
 
-    # valor
-    df["Valor"] = df["Valor"].apply(moeda_to_float)
+@st.cache_data
+def carregar_tudo():
+    ss = conectar_sheets()
+    ws_base = garantir_base_cols(ss)
+    ws_lanc = garantir_aba(ss, ABA_LANC,
+        ["IDLanc","DataAtendimento","Cliente","Combo","Servicos","ValorTotal","Vencimento","Funcionario","Fase","Tipo","Periodo"])
+    ws_pagt = garantir_aba(ss, ABA_PAGT,
+        ["IDPagamento","IDLanc","DataPagamento","Cliente","FormaPagamento","ValorPago","Obs"])
+    garantir_aba_despesas(ss)
 
-    # colunas auxiliares para filtros
-    df["Data_dt"]  = df["Data"].apply(_parse_date_br)
-    df["Venc_dt"]  = df["VencimentoFiado"].apply(_parse_date_br)
-    df["Quitado_dt"] = df["DataPagamento"].apply(_parse_date_br)
+    df_base = get_as_dataframe(ws_base, evaluate_formulas=True, header=0).dropna(how="all")
+    df_lanc = get_as_dataframe(ws_lanc, evaluate_formulas=True, header=0).dropna(how="all")
+    df_pagt = get_as_dataframe(ws_pagt, evaluate_formulas=True, header=0).dropna(how="all")
 
-    # não remover linhas que tenham Data preenchida
-    if len(df):
-        def _is_row_empty(row):
-            r = row.fillna("")
-            if str(r.get("Data","")).strip() != "": return False
-            cols_check = [c for c in df.columns if not c.endswith("_dt")]
-            return "".join(str(r[c]) for c in cols_check).strip() == ""
-        mask_empty = df.apply(_is_row_empty, axis=1)
-        df = df.loc[~mask_empty].copy()
-    return df
-
-# -------- Auth path
-def abrir_planilha_com_auth(spreadsheet_id: str):
-    svc = _get_service_account_from_secrets()
-    if not svc:
-        st.error("Credenciais não encontradas (GCP_SERVICE_ACCOUNT/gcp_service_account)."); st.stop()
-    creds = Credentials.from_service_account_info(
-        svc, scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    )
-    client = gspread.authorize(creds)
-    sh = client.open_by_key(spreadsheet_id)
-    abas = [ws.title for ws in sh.worksheets()]
-    alvo = None
-    for possivel in ABA_FEMININO_ALVOS:
-        if any(aba.strip().lower()==possivel.strip().lower() for aba in abas):
-            alvo = possivel; break
-    if alvo is None:
-        alvo = abas[0]; st.warning(f"Aba Feminino não encontrada. Usando: {alvo}")
-    ws = sh.worksheet(alvo)
-    return sh, ws, abas, alvo
-
-def carregar_df_auth(ws): 
-    return normalizar_df(get_as_dataframe(ws, evaluate_formulas=True, header=0, dtype=str))
-
-def salvar_df_auth(ws, df: pd.DataFrame):
-    df = df.copy()
-    # datas em texto BR
-    for col in ["Data","VencimentoFiado","Fiado_Vencimento","DataPagamento","Quitado_em"]:
-        if col in df.columns: df[col] = df[col].apply(_fmt_ddmmyyyy)
-    # tirar auxiliares
-    df = df.loc[:, [c for c in df.columns if not c.endswith("_dt")]]
-    # garantir colunas
-    cols = list(dict.fromkeys(list(df.columns) + COLS_OBRIGATORIAS))
-    df = df.reindex(columns=cols)
-    set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
-
-# -------- CSV path (somente leitura)
-def _csv_from_sheet(sheet_name: str) -> pd.DataFrame|None:
-    quoted = urllib.parse.quote(sheet_name, safe="")
-    url_csv = f"https://docs.google.com/spreadsheets/d/{SHEET_ID_MEIRE}/gviz/tq?tqx=out:csv&sheet={quoted}"
     try:
-        df = pd.read_csv(url_csv)
-        if len(df.columns)==1 and str(df.columns[0]).startswith("<!DOCTYPE html"): return None
-        return df
+        dfb = df_base.copy()
+        dfb["Cliente"] = dfb["Cliente"].astype(str).str.strip()
+        clientes = sorted([c for c in dfb["Cliente"].dropna().unique() if c])
+        combos  = sorted([c for c in dfb["Combo"].dropna().unique() if c])
+        servs   = sorted([s for s in dfb["Serviço"].dropna().unique() if s] + list(VALORES_PADRAO.keys()))
+        contas_raw = [c for c in dfb["Conta"].dropna().astype(str).str.strip().unique() if c]
+        contas = sorted([c for c in contas_raw if c.lower() != "fiado"])
     except Exception:
+        clientes, combos, servs, contas = [], [], [], []
+    return df_base, df_lanc, df_pagt, clientes, combos, servs, contas
+
+def salvar_df(nome_aba, df):
+    ss = conectar_sheets()
+    ws = ss.worksheet(nome_aba)
+    ws.clear()
+    set_with_dataframe(ws, df)
+
+def append_row(nome_aba, vals):
+    ss = conectar_sheets()
+    ss.worksheet(nome_aba).append_row(vals, value_input_option="USER_ENTERED")
+
+def gerar_id(prefixo):
+    return f"{prefixo}-{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')[:-3]}"
+
+def parse_combo(combo_str):
+    if not combo_str:
+        return []
+    partes = [p.strip() for p in str(combo_str).split("+") if p.strip()]
+    ajustadas = []
+    for p in partes:
+        hit = next((k for k in VALORES_PADRAO.keys() if k.lower() == p.lower()), p)
+        ajustadas.append(hit)
+    return ajustadas
+
+def ultima_forma_pagto_cliente(df_base, cliente):
+    if df_base.empty or not cliente:
+        return None
+    df = df_base[(df_base["Cliente"] == cliente) & (df_base["Conta"].str.lower() != "fiado")].copy()
+    if df.empty:
+        return None
+    try:
+        df["__d"] = pd.to_datetime(df["Data"], format=DATA_FMT, errors="coerce")
+        df = df.sort_values("__d", ascending=False)
+    except Exception:
+        pass
+    return str(df.iloc[0]["Conta"]) if not df.empty else None
+
+def inserir_despesas_lote(linhas_despesas):
+    ss = conectar_sheets()
+    ws, headers = garantir_aba_despesas(ss)
+
+    def pega_col(nome_alvo):
+        for h in headers:
+            if h.strip().lower() == nome_alvo.strip().lower():
+                return h
         return None
 
-def carregar_df_sem_auth():
-    for nome in ABA_FEMININO_ALVOS:
-        df = _csv_from_sheet(nome)
-        if df is not None: return normalizar_df(df), nome
-    df = _csv_from_sheet("Base%20de%20Dados")
-    if df is not None: return normalizar_df(df), "Base de Dados"
-    st.error("Não consegui ler a planilha via CSV. Compartilhe com link (leitura)."); st.stop()
+    col_data      = pega_col("Data") or "Data"
+    col_prest     = pega_col("Prestador") or "Prestador"
+    col_desc      = pega_col("Descrição") or "Descrição"
+    col_valor     = pega_col("Valor") or "Valor"
+    col_forma_pag = pega_col("Forma de Pagamento") or "Forma de Pagamento"
 
-# -------- Load
-HAS_AUTH = _tem_auth()
-if not HAS_AUTH:
-    st.warning("Sem credenciais: modo leitura via CSV (sem escrita).")
+    if not headers:
+        headers = [col_data, col_prest, col_desc, col_valor, col_forma_pag]
+        ws.append_row(headers)
 
-if HAS_AUTH:
-    sh, ws, abas_disp, aba_usada = abrir_planilha_com_auth(SHEET_ID_MEIRE)
-    st.success(f"Conectado (auth). Aba: **{aba_usada}**"); st.caption(", ".join(abas_disp))
-    df_base = carregar_df_auth(ws); EDITAVEL = True
-else:
-    df_base, aba_usada = carregar_df_sem_auth()
-    st.info(f"Conectado (somente leitura CSV). Aba: **{aba_usada}**")
-    EDITAVEL = False
+    for d in linhas_despesas:
+        linha = {
+            col_data: d.get("Data",""),
+            col_prest: d.get("Prestador",""),
+            col_desc: d.get("Descrição",""),
+            col_valor: d.get("Valor",""),
+            col_forma_pag: d.get("Forma de Pagamento",""),
+        }
+        ordered = [linha.get(h, "") for h in headers]
+        ws.append_row(ordered, value_input_option="USER_ENTERED")
 
-# -------- Opções dinâmicas
-clientes_opts = sorted([c for c in df_base["Cliente"].dropna().unique() if str(c).strip()])
-servicos_opts = sorted([s for s in df_base["Serviço"].dropna().unique() if str(s).strip()])
-periodos_opts = sorted([p for p in df_base.get("Período", pd.Series([])).dropna().unique() if str(p).strip()])
-formas_pagamento = sorted([c for c in df_base.get("Conta", pd.Series([])).dropna().unique() if str(c).strip()]
-                          + ["Carteira","Pix","Nubank","Nubank CNPJ","Dinheiro","Cartão"])
+# ===== Página =====
+df_base, df_lanc, df_pagt, clientes, combos_exist, servs_exist, contas_exist = carregar_tudo()
 
-# -------- Sidebar
 st.sidebar.header("Ações")
-modo = st.sidebar.radio("Escolha:", ["➕ Lançar fiado","💵 Registrar pagamento","📄 Em aberto & exportação"], index=0)
+acao = st.sidebar.radio("Escolha:", ["➕ Lançar fiado","💰 Registrar pagamento","📋 Em aberto & exportação"])
 
-# -------- Lançar fiado
-if modo.startswith("➕"):
-    st.subheader("Lançar fiado — cria UMA linha por serviço (Conta='Fiado')")
-    if not EDITAVEL: st.warning("Modo leitura: lançar fiado desativado.")
-    colA,colB = st.columns([1,1])
-    with colA:
-        data_atend = st.date_input("Data do atendimento", value=date.today(), disabled=not EDITAVEL)
-        cliente_sel = st.selectbox("Cliente (selecione)", ["—"] + clientes_opts, index=0, disabled=not EDITAVEL)
-        cliente_digitado = st.text_input("Ou digite o nome do cliente", "", disabled=not EDITAVEL)
-        combo_txt = st.text_input("Combo (use 'serv1+serv2')", "", disabled=not EDITAVEL)
-        servico_sel = st.selectbox("Ou selecione um serviço", ["—"] + servicos_opts, index=0, disabled=not EDITAVEL)
-        valor_unico = st.text_input("Valor (R$) — no combo aplica no 1º", "", disabled=not EDITAVEL)
-    with colB:
-        venc_opc = st.date_input("Vencimento (opcional)", value=None, format="YYYY/MM/DD", disabled=not EDITAVEL)
-        fase = st.selectbox("Fase", ["Dono (sozinha)","Autônomo (prestador)","Dono + funcionário"], index=0, disabled=not EDITAVEL)
-        tipo = st.selectbox("Tipo", ["Serviço","Produto"], index=0, disabled=not EDITAVEL)
-        periodo = st.selectbox("Período (opcional)", ["—"] + periodos_opts, index=0, disabled=not EDITAVEL)
-        observ = st.text_area("Observação (opcional)", "", disabled=not EDITAVEL)
+# ---------- 1) Lançar fiado ----------
+if acao == "➕ Lançar fiado":
+    st.subheader("➕ Lançar fiado — cria UMA linha por serviço na Base Feminina (Conta='Fiado', StatusFiado='Em aberto')")
 
-    funcionario, conta = "Meire","Fiado"
+    c1, c2 = st.columns(2)
+    with c1:
+        cliente = st.selectbox("Cliente", options=[""] + clientes, index=0)
+        if not cliente:
+            cliente = st.text_input("Ou digite o nome do cliente", "")
+        combo_str = st.selectbox("Combo (use 'unha mão+sobrancelhas')", [""] + combos_exist)
+        servico_unico = st.selectbox("Ou selecione um serviço (se não usar combo)", [""] + servs_exist)
+        funcionario = st.selectbox("Funcionário", ["Meire"], index=0)
+    with c2:
+        data_atend = st.date_input("Data do atendimento", value=date.today())
+        venc = st.date_input("Vencimento (opcional)", value=date.today())
+        fase = st.text_input("Fase", value="Dono + funcionário")
+        tipo = st.selectbox("Tipo", ["Serviço", "Produto"], index=0)
+        periodo = st.selectbox("Período (opcional)", ["", "Manhã", "Tarde", "Noite"], index=0)
 
-    if st.button("Salvar fiado", type="primary", disabled=not EDITAVEL):
-        cliente = cliente_sel if cliente_sel != "—" else cliente_digitado.strip()
-        if not cliente: st.error("Informe o cliente."); st.stop()
+    servicos = parse_combo(combo_str) if combo_str else ([servico_unico] if servico_unico else [])
+    valores_custom = {}
+    if servicos:
+        st.markdown("#### 💰 Edite os valores antes de salvar")
+        for s in servicos:
+            padrao = VALORES_PADRAO.get(s, 0.0)
+            valores_custom[s] = st.number_input(
+                f"{s} (padrão: R$ {padrao:.2f})", value=float(padrao), step=1.0, format="%.2f", key=f"valor_{s}"
+            )
 
-        # monta serviços
-        linhas=[]
-        if combo_txt.strip():
-            partes=[p.strip() for p in combo_txt.split("+") if p.strip()]
-            if not partes: st.error("Combo vazio após separar por '+'."); st.stop()
-            valores=[moeda_to_float(valor_unico)] + [0.0]*(len(partes)-1)
-            for i,srv in enumerate(partes):
-                linhas.append({"Serviço":srv,"Valor":valores[i],"Combo":combo_txt})
+    if st.button("Salvar fiado", use_container_width=True):
+        if not cliente:
+            st.error("Informe o cliente.")
+        elif not servicos:
+            st.error("Informe combo ou um serviço.")
         else:
-            if servico_sel=="—": st.error("Informe um combo OU um serviço."); st.stop()
-            linhas.append({"Serviço":servico_sel,"Valor":moeda_to_float(valor_unico),"Combo":""})
+            idl = gerar_id("L")
+            data_str = data_atend.strftime(DATA_FMT)
+            venc_str = venc.strftime(DATA_FMT) if venc else ""
 
-        novos=[]
-        for L in linhas:
-            _id = _gen_lanc_id("L")
-            novos.append({
-                # comuns
-                "Data": data_atend.strftime("%d/%m/%Y"),
-                "Serviço": L["Serviço"],
-                "Valor": L["Valor"],
-                "Conta": conta,
-                "Cliente": cliente,
-                "Combo": L["Combo"],
-                "Funcionário": funcionario,
-                "Fase": fase,
-                "Tipo": tipo,
-                "Período": (periodo if periodo != "—" else ""),
-                "Observação": observ,
-                # fiado (novo padrão)
-                "StatusFiado": "Em aberto",
-                "IDLancFiado": _id,
-                "VencimentoFiado": (venc_opc.strftime("%d/%m/%Y") if venc_opc else ""),
-                "DataPagamento": "",
-                # compat antigo
-                "Fiado_Status": "Em aberto",
-                "Fiado_Vencimento": (venc_opc.strftime("%d/%m/%Y") if venc_opc else ""),
-                "Quitado_em": "",
-            })
-        df_novos = pd.DataFrame(novos)
+            novas = []
+            for s in servicos:
+                valor_item = float(valores_custom.get(s, VALORES_PADRAO.get(s, 0.0)))
+                novas.append({
+                    "Data": data_str, "Serviço": s, "Valor": valor_item, "Conta": "Fiado",
+                    "Cliente": cliente, "Combo": combo_str if combo_str else "", "Funcionário": funcionario,
+                    "Fase": fase, "Tipo": tipo, "Período": periodo,
+                    "StatusFiado": "Em aberto", "IDLancFiado": idl, "VencimentoFiado": venc_str,
+                    "DataPagamento": ""
+                })
 
-        df_final = pd.concat([df_base, df_novos], ignore_index=True)
-        salvar_df_auth(ws, df_final)
-        st.success(f"Lançado com sucesso para **{cliente}** ({len(df_novos)} linha(s)).")
-        st.balloons()
+            ss = conectar_sheets()
+            ws_base = ss.worksheet(ABA_BASE)
+            dfb = get_as_dataframe(ws_base, evaluate_formulas=True, header=0).dropna(how="all")
+            for c in BASE_COLS_MIN + EXTRA_COLS:
+                if c not in dfb.columns:
+                    dfb[c] = ""
+            dfb = pd.concat([dfb, pd.DataFrame(novas)], ignore_index=True)
+            salvar_df(ABA_BASE, dfb)
 
-# -------- Registrar pagamento
-elif modo.startswith("💵"):
-    st.subheader("Registrar pagamento (quitar por competência)")
-    if not EDITAVEL: st.warning("Modo leitura: quitação desativada.")
+            total = float(pd.to_numeric(pd.DataFrame(novas)["Valor"], errors="coerce").fillna(0).sum())
+            append_row(ABA_LANC, [idl, data_str, cliente, combo_str, "+".join(servicos),
+                                  total, venc_str, funcionario, fase, tipo, periodo])
 
-    col1,col2,col3 = st.columns([1,1,1])
-    with col1:
-        cliente_pg = st.selectbox("Cliente", ["—"] + clientes_opts, index=0, disabled=not EDITAVEL)
-        forma = st.selectbox("Forma de pagamento", formas_pagamento, index=0, disabled=not EDITAVEL)
-    with col2:
-        data_quit = st.date_input("Data do pagamento", value=date.today(), disabled=not EDITAVEL)
-        somente_servicos = st.checkbox("Somente 'Serviço'", True, disabled=not EDITAVEL)
-    with col3:
-        filtro_vencidos = st.checkbox("Apenas vencidos", False, disabled=not EDITAVEL)
-        incluir_sem_venc = st.checkbox("Incluir sem vencimento", True, disabled=not EDITAVEL)
+            st.success(f"Fiado criado para **{cliente}** — ID: {idl}. Geradas {len(novas)} linhas na Base Feminina.")
+            st.cache_data.clear()
 
-    if cliente_pg != "—":
-        mask = (df_base["Cliente"].astype(str)==cliente_pg) & (df_base["Conta"].str.lower()=="fiado") & \
-               (df_base["StatusFiado"].astype(str).str.lower().isin(["","em aberto"]))
-        if somente_servicos and "Tipo" in df_base.columns:
-            mask &= (df_base["Tipo"].astype(str).str.lower()=="serviço")
-        hoje = date.today()
-        if filtro_vencidos:
-            venc = df_base.get("Venc_dt")
-            mask &= (venc.notna() & (venc.dt.date < hoje))
-            if incluir_sem_venc:
-                mask |= ((df_base["Cliente"].astype(str)==cliente_pg) &
-                         (df_base["Conta"].str.lower()=="fiado") &
-                         (df_base["StatusFiado"].astype(str).str.lower().isin(["","em aberto"])) &
-                         (venc.isna()))
-        df_aberto = df_base[mask].copy()
-        st.markdown(f"**Fiados em aberto para {cliente_pg}: {len(df_aberto)}**")
-        if len(df_aberto)==0:
-            st.info("Nenhuma linha com os filtros atuais.")
-        else:
-            cols_show = ["Data","Serviço","Valor","VencimentoFiado","Período","IDLancFiado","Observação"]
-            cols_show = [c for c in cols_show if c in df_aberto.columns]
-            st.dataframe(df_aberto[cols_show].reset_index(drop=True), use_container_width=True)
+# ---------- 2) Registrar pagamento (COMPETÊNCIA) ----------
+elif acao == "💰 Registrar pagamento":
+    st.subheader("💰 Registrar pagamento — escolha o cliente e depois o(s) fiado(s) em aberto")
 
-            if st.button("Registrar pagamento (quitar todos filtrados)", type="primary", disabled=not EDITAVEL):
-                df_edit = df_base.copy()
-                idxs = df_aberto.index
-                for idx in idxs:
-                    df_edit.loc[idx, "StatusFiado"] = "Pago"
-                    df_edit.loc[idx, "Fiado_Status"] = "Pago"      # compat
-                    df_edit.loc[idx, "DataPagamento"] = data_quit.strftime("%d/%m/%Y")
-                    df_edit.loc[idx, "Quitado_em"]   = data_quit.strftime("%d/%m/%Y")  # compat
-                    df_edit.loc[idx, "Conta"] = forma
-                salvar_df_auth(ws, df_edit)
-                st.success(f"Quitado com sucesso: {len(idxs)} linha(s) de {cliente_pg}.")
-                st.balloons()
+    df_abertos = df_base[df_base.get("StatusFiado", "") == "Em aberto"].copy()
+    clientes_abertos = sorted(df_abertos["Cliente"].dropna().unique().tolist())
 
-# -------- Em aberto & exportação
-else:
-    st.subheader("Fiados em aberto")
-    df_em_aberto = df_base[
-        (df_base["Conta"].astype(str).str.lower()=="fiado") &
-        (df_base["StatusFiado"].astype(str).str.lower().isin(["","em aberto"]))
-    ].copy()
+    colc1, colc2 = st.columns([1, 1])
+    with colc1:
+        cliente_sel = st.selectbox("Cliente com fiado em aberto", options=[""] + clientes_abertos, index=0)
 
-    colf1,colf2 = st.columns([1,3])
-    with colf1:
-        cliente_f = st.selectbox("Filtrar por cliente", ["—"] + sorted(df_em_aberto["Cliente"].dropna().unique().tolist()))
-        periodo_f = st.selectbox("Filtrar por período", ["—"] + sorted(df_em_aberto["Período"].dropna().unique().tolist()))
-    with colf2:
-        venc_ate = st.date_input("Vencimento até (opcional)", value=None)
+    ultima = ultima_forma_pagto_cliente(df_base, cliente_sel) if cliente_sel else None
+    lista_contas = contas_exist or ["Pix", "Dinheiro", "Cartão", "Transferência", "Outro"]
+    default_idx = lista_contas.index(ultima) if (ultima in lista_contas) else 0
+    with colc2:
+        forma_pag = st.selectbox("Forma de pagamento (quitação)", options=lista_contas, index=default_idx)
 
-    if cliente_f != "—": df_em_aberto = df_em_aberto[df_em_aberto["Cliente"]==cliente_f]
-    if periodo_f != "—": df_em_aberto = df_em_aberto[df_em_aberto["Período"]==periodo_f]
-    if venc_ate:
-        vencs = df_em_aberto.get("Venc_dt")
-        df_em_aberto = df_em_aberto[vencs.notna() & (vencs.dt.date <= venc_ate)]
+    # IDs do cliente com rótulo amigável
+    ids_opcoes = []
+    if cliente_sel:
+        grupo_cli = df_abertos[df_abertos["Cliente"] == cliente_sel].copy()
+        grupo_cli["Data"] = pd.to_datetime(grupo_cli["Data"], errors="coerce").dt.strftime(DATA_FMT)
+        grupo_cli["Valor"] = pd.to_numeric(grupo_cli["Valor"], errors="coerce").fillna(0)
 
-    total_aberto = df_em_aberto["Valor"].apply(moeda_to_float).sum() if len(df_em_aberto) else 0.0
-    st.metric("Total em aberto (R$)", f"{total_aberto:,.2f}".replace(",", "v").replace(".", ",").replace("v","."))
+        def atraso_max(idval):
+            v = grupo_cli.loc[grupo_cli["IDLancFiado"] == idval, "VencimentoFiado"].dropna().astype(str)
+            try:
+                vdt = pd.to_datetime(v.iloc[0], format=DATA_FMT, errors="coerce").date() if not v.empty else None
+            except Exception:
+                vdt = None
+            if vdt:
+                d = (date.today() - vdt).days
+                return d if d > 0 else 0
+            return 0
 
-    cols_show = ["Data","Cliente","Serviço","Valor","VencimentoFiado","Período","IDLancFiado","Observação"]
-    cols_show = [c for c in cols_show if c in df_em_aberto.columns]
-    st.dataframe(
-        df_em_aberto[cols_show].sort_values(by=["Cliente","Data_dt"], ascending=[True,True]).reset_index(drop=True),
-        use_container_width=True
+        resumo_ids = (
+            grupo_cli.groupby("IDLancFiado", as_index=False)
+            .agg(Data=("Data", "min"), ValorTotal=("Valor", "sum"), Qtde=("Serviço", "count"), Combo=("Combo", "first"))
+        )
+        for _, r in resumo_ids.iterrows():
+            atraso = atraso_max(r["IDLancFiado"])
+            badge = "Em dia" if atraso <= 0 else f"{int(atraso)}d atraso"
+            rotulo = f"{r['IDLancFiado']} • {r['Data']} • {int(r['Qtde'])} serv. • R$ {r['ValorTotal']:.2f} • {badge}"
+            if pd.notna(r["Combo"]) and str(r["Combo"]).strip():
+                rotulo += f" • {r['Combo']}"
+            ids_opcoes.append((r["IDLancFiado"], rotulo))
+
+    ids_valores = [i[0] for i in ids_opcoes]
+    labels = {i: l for i, l in ids_opcoes}
+
+    select_all = st.checkbox("Selecionar todos os fiados deste cliente", value=False, disabled=not bool(ids_valores))
+    id_selecionados = st.multiselect(
+        "Selecione 1 ou mais fiados do cliente",
+        options=ids_valores,
+        default=(ids_valores if select_all else []),
+        format_func=lambda x: labels.get(x, x),
     )
 
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_em_aberto.to_excel(writer, index=False, sheet_name="Fiado_Em_Aberto")
-    st.download_button("📥 Baixar Excel (em aberto)", data=buf.getvalue(),
-        file_name=f"fiado_em_aberto_{date.today()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    cold1, cold2 = st.columns([1, 1])
+    with cold1:
+        data_pag = st.date_input("Data do pagamento", value=date.today())
+    with cold2:
+        obs = st.text_input("Observação (opcional)", "")
 
-st.caption(f"{'Edição habilitada (auth)' if HAS_AUTH else 'Somente leitura (CSV)'} · Planilha: {PLANILHA_URL_MEIRE} · Aba: {aba_usada}")
+    total_sel = 0.0
+    bloco_comissao = {}
+    registrar_comissao = False
+
+    if id_selecionados:
+        subset = df_abertos[df_abertos["IDLancFiado"].isin(id_selecionados)].copy()
+        subset["Valor"] = pd.to_numeric(subset["Valor"], errors="coerce").fillna(0)
+        total_sel = float(subset["Valor"].sum())
+
+        st.info(
+            f"Cliente: **{cliente_sel}** • IDs: {', '.join(id_selecionados)} • "
+            f"Total: **R$ {total_sel:,.2f}**".replace(",", "X").replace(".", ",").replace("X", ".")
+        )
+
+        resumo_srv = (
+            subset.groupby("Serviço", as_index=False)
+            .agg(Qtd=("Serviço", "count"), Total=("Valor", "sum"))
+            .sort_values(["Qtd", "Total"], ascending=[False, False])
+        )
+        resumo_srv["Total"] = resumo_srv["Total"].map(
+            lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        )
+        st.caption("Resumo por serviço selecionado:")
+        st.dataframe(resumo_srv, use_container_width=True, hide_index=True)
+
+        # Comissão (desativada por padrão; ative se quiser lançar p/ Meire)
+        st.markdown("---")
+        funcs = subset["Funcionário"].dropna().astype(str).unique().tolist()
+        registrar_comissao = st.checkbox("Registrar comissão na aba Despesas agora", value=False)
+
+        subset["__DataAtend"] = pd.to_datetime(subset["Data"], format=DATA_FMT, errors="coerce").dt.date
+        ref_date_por_func = {}
+        for f in funcs:
+            datas_f = set(subset.loc[subset["Funcionário"] == f, "__DataAtend"].dropna().tolist())
+            ref_date_por_func[f] = list(datas_f)[0] if len(datas_f) == 1 else None
+
+        if registrar_comissao:
+            st.caption("Edite os valores sugeridos (padrão 50% do subtotal por funcionário).")
+            for f in funcs:
+                subf = subset[subset["Funcionário"] == f]
+                subtotal_f = float(subf["Valor"].sum())
+
+                st.markdown(f"**Funcionário:** {f}")
+                c1, c2, c3, c4 = st.columns([1,1,1,2])
+                with c1:
+                    ref_dt = ref_date_por_func.get(f)
+                    data_base = ref_dt if ref_dt is not None else data_pag
+                    data_desp_f = st.date_input(f"Data da despesa ({f})", value=data_base, key=f"dt_{f}")
+                with c2:
+                    forma_desp_f = st.selectbox(f"Forma de Pagamento ({f})",
+                                                options=["Dinheiro","Pix","Cartão","Transferência","Outro"],
+                                                index=0, key=f"fp_{f}")
+                with c3:
+                    valor_sug = round(subtotal_f * 0.50, 2)
+                    valor_com_f = st.number_input(f"Valor comissão ({f}) — sugestão 50%",
+                                                  value=float(valor_sug), min_value=0.0, step=1.0, format="%.2f",
+                                                  key=f"vl_{f}")
+                with c4:
+                    desc_f = st.text_input(f"Descrição ({f})", value=f"Comissão {f}", key=f"ds_{f}")
+
+                bloco_comissao[f] = {
+                    "Data": data_desp_f.strftime(DATA_FMT),
+                    "Prestador": f,
+                    "Descrição": desc_f,
+                    "Valor": valor_com_f,
+                    "Forma de Pagamento": forma_desp_f,
+                }
+
+    disabled_btn = not (cliente_sel and id_selecionados and forma_pag)
+    if st.button("Registrar pagamento", use_container_width=True, disabled=disabled_btn):
+        ss = conectar_sheets()
+        ws_base = ss.worksheet(ABA_BASE)
+        dfb = get_as_dataframe(ws_base, evaluate_formulas=True, header=0).dropna(how="all")
+
+        if "DataPagamento" not in dfb.columns:
+            dfb["DataPagamento"] = ""
+
+        mask = dfb.get("IDLancFiado", "").isin(id_selecionados)
+        if not mask.any():
+            st.error("Nenhuma linha encontrada para os IDs selecionados.")
+        else:
+            subset_all = dfb[mask].copy()
+            subset_all["Valor"] = pd.to_numeric(subset_all["Valor"], errors="coerce").fillna(0)
+            total_pago = float(subset_all["Valor"].sum())
+
+            # Atualiza por COMPETÊNCIA (não cria linhas novas)
+            dfb.loc[mask, "Conta"] = forma_pag
+            dfb.loc[mask, "StatusFiado"] = "Pago"
+            dfb.loc[mask, "VencimentoFiado"] = ""
+            dfb.loc[mask, "DataPagamento"] = data_pag.strftime(DATA_FMT)
+
+            salvar_df(ABA_BASE, dfb)
+
+            append_row(
+                ABA_PAGT,
+                [
+                    f"P-{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')[:-3]}",
+                    ";".join(id_selecionados),
+                    data_pag.strftime(DATA_FMT),
+                    cliente_sel,
+                    forma_pag,
+                    total_pago,
+                    obs,
+                ],
+            )
+
+            if registrar_comissao and bloco_comissao:
+                linhas = []
+                for func, dados in bloco_comissao.items():
+                    if float(dados.get("Valor", 0) or 0) <= 0:
+                        continue
+                    linhas.append(dados)
+                if linhas:
+                    try:
+                        inserir_despesas_lote(linhas)
+                        st.success("Comissão lançada na aba **Despesas**.")
+                    except Exception as e:
+                        st.warning(f"Pagamento quitado, mas houve problema ao lançar comissão em Despesas: {e}")
+
+            st.success(
+                f"Pagamento registrado para **{cliente_sel}** (competência). "
+                f"IDs quitados: {', '.join(id_selecionados)}. "
+                f"Total: R$ {total_pago:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            )
+            st.cache_data.clear()
+
+# ---------- 3) Em aberto & exportação ----------
+else:
+    st.subheader("📋 Fiados em aberto (agrupados por ID) — Feminino")
+    if df_base.empty:
+        st.info("Sem dados.")
+    else:
+        em_aberto = df_base[df_base.get("StatusFiado","") == "Em aberto"].copy()
+        if em_aberto.empty:
+            st.success("Nenhum fiado em aberto 🎉")
+        else:
+            colf1, colf2 = st.columns([2,1])
+            with colf1:
+                filtro_cliente = st.text_input("Filtrar por cliente (opcional)", "")
+                if filtro_cliente.strip():
+                    em_aberto = em_aberto[
+                        em_aberto["Cliente"].str.contains(filtro_cliente.strip(), case=False, na=False)
+                    ]
+            with colf2:
+                funcionarios_abertos = sorted(
+                    em_aberto["Funcionário"].dropna().astype(str).unique().tolist()
+                )
+                filtro_func = st.selectbox("Filtrar por funcionário (opcional)", [""] + funcionarios_abertos)
+                if filtro_func:
+                    em_aberto = em_aberto[em_aberto["Funcionário"] == filtro_func]
+
+            hoje = date.today()
+            def parse_dt(x):
+                try:
+                    return datetime.strptime(str(x), DATA_FMT).date()
+                except Exception:
+                    return None
+            em_aberto["__venc"] = em_aberto["VencimentoFiado"].apply(parse_dt)
+            em_aberto["DiasAtraso"] = em_aberto["__venc"].apply(
+                lambda d: (hoje - d).days if (d is not None and hoje > d) else 0
+            )
+            em_aberto["Situação"] = em_aberto["DiasAtraso"].apply(lambda n: "Em dia" if n<=0 else f"{int(n)}d atraso")
+
+            em_aberto["Valor"] = pd.to_numeric(em_aberto["Valor"], errors="coerce").fillna(0)
+            resumo = (
+                em_aberto.groupby(["IDLancFiado","Cliente"], as_index=False)
+                .agg(ValorTotal=("Valor","sum"), QtdeServicos=("Serviço","count"),
+                     Combo=("Combo","first"), MaxAtraso=("DiasAtraso","max"))
+            )
+            resumo["Situação"] = resumo["MaxAtraso"].apply(lambda n: "Em dia" if n<=0 else f"{int(n)}d atraso")
+
+            st.dataframe(
+                resumo.sort_values(["MaxAtraso","ValorTotal"], ascending=[False, False])[[
+                    "IDLancFiado","Cliente","ValorTotal","QtdeServicos","Combo","Situação"
+                ]],
+                use_container_width=True, hide_index=True
+            )
+
+            total = float(resumo["ValorTotal"].sum())
+            st.metric("Total em aberto", f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+
+            try:
+                from openpyxl import Workbook  # noqa
+                buf = BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                    em_aberto.sort_values(["Cliente","IDLancFiado","Data"]).to_excel(
+                        w, index=False, sheet_name="Fiado_Em_Aberto_Feminino"
+                    )
+                st.download_button("⬇️ Exportar (Excel)", data=buf.getvalue(), file_name="fiado_em_aberto_feminino.xlsx")
+            except Exception:
+                csv_bytes = em_aberto.sort_values(["Cliente","IDLancFiado","Data"]).to_csv(
+                    index=False
+                ).encode("utf-8-sig")
+                st.download_button("⬇️ Exportar (CSV)", data=csv_bytes, file_name="fiado_em_aberto_feminino.csv")
