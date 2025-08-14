@@ -1,74 +1,60 @@
+# pages/30_teste.py
+
+import streamlit as st
+import pandas as pd
+import gspread
+from gspread_dataframe import get_as_dataframe
+from google.oauth2.service_account import Credentials
+
+st.set_page_config(layout="wide")
+st.title("🔧 Teste — Leitura da Planilha")
+
+# ---- CONFIG ----
+SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
+ABA = "Base de Dados"  # troque se quiser testar outra aba
+GID = "0"              # gid da aba (só para fallback CSV)
+
 @st.cache_data(ttl=300, show_spinner=True)
-def carregar_dados():
+def carregar_dados(sheet_id: str, aba: str, gid: str):
     """
-    1) Tenta via Service Account (GCP_SERVICE_ACCOUNT ou gcp_service_account)
-    2) Fallback: CSV público da aba feminina
-    3) Normaliza/renomeia colunas p/ garantir: Data, Cliente, Valor
+    1) Tenta via Service Account (aceita GCP_SERVICE_ACCOUNT ou gcp_service_account)
+    2) Fallback via CSV público
+    3) Normaliza colunas básicas
     """
-    # ---------- Tentativa 1: Service Account ----------
+    # Tentativa: service account
     try:
         sa_info = st.secrets.get("GCP_SERVICE_ACCOUNT") or st.secrets.get("gcp_service_account")
         if not sa_info:
-            raise KeyError("Service account não encontrado em st.secrets")
+            raise KeyError("segredo não encontrado")
         creds = Credentials.from_service_account_info(
             sa_info,
-            scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"],
+            scopes=[
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive",
+            ],
         )
         client = gspread.authorize(creds)
-        ws = client.open_by_key(SHEET_ID).worksheet(ABA_FEMININO)
+        ws = client.open_by_key(sheet_id).worksheet(aba)
         df = get_as_dataframe(ws, evaluate_formulas=False).dropna(how="all")
         fonte = "service_account"
     except Exception:
-        # ---------- Fallback CSV (planilha deve estar pública p/ leitura) ----------
-        url_csv = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID_FEMININO}"
+        url_csv = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
         df = pd.read_csv(url_csv)
         fonte = "csv"
 
-    # ------- Normaliza cabeçalhos -------
+    # normalização mínima
     df.columns = [str(c).strip() for c in df.columns]
-
-    # Mapeia aliases comuns -> oficial
-    aliases = {
-        "valor (r$)": "Valor",
-        "valor r$": "Valor",
-        "preço": "Valor",
-        "preco": "Valor",
-        "price": "Valor",
-        "nome": "Cliente",
-        "cliente(a)": "Cliente",
-        "data do atendimento": "Data",
-        "dt": "Data",
-    }
-    # renomeia pelos aliases existentes
-    rename_map = {}
-    lower_map = {c.lower(): c for c in df.columns}
-    for k_lower, target in aliases.items():
-        if k_lower in lower_map and target not in df.columns:
-            rename_map[lower_map[k_lower]] = target
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # Garante as 3 mínimas (sem travar o app)
-    if "Data" not in df.columns:
-        st.warning("Coluna 'Data' não encontrada — criando vazia.")
-        df["Data"] = pd.NaT
-    if "Cliente" not in df.columns:
-        st.warning("Coluna 'Cliente' não encontrada — criando vazia.")
-        df["Cliente"] = ""
-    if "Valor" not in df.columns:
-        st.warning("Coluna 'Valor' não encontrada — criando com 0.0 (renomeie na planilha para melhorar).")
-        df["Valor"] = 0.0
-
-    # Tipos básicos
-    df["Data"] = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
-    df = df.dropna(subset=["Data"]).copy()
-    df["Ano"] = df["Data"].dt.year
-
-    if "Conta" in df.columns:
-        df["Conta"] = df["Conta"].astype(str).str.strip()
-    else:
-        df["Conta"] = "Indefinido"
-
-    df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce").fillna(0.0)
+    if "Data" in df.columns:
+        df["Data"] = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
+    if "Valor" in df.columns:
+        df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce").fillna(0.0)
 
     return df, fonte
+
+def main():
+    df, fonte = carregar_dados(SHEET_ID, ABA, GID)
+    st.caption(f"Fonte: **{fonte}** — linhas: {len(df)} • colunas: {len(df.columns)}")
+    st.dataframe(df.head(50), use_container_width=True)
+
+if __name__ == "__main__":
+    main()
