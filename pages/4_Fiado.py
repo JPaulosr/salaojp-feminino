@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 # 12F_Fiado_Meire.py — App FIADO exclusivo do Salão Feminino (Meire)
+# - Fallback de secrets para SHEET_ID_MEIRE/PLANILHA_URL_MEIRE
+# - Checagem de conexão (exibe título da planilha)
 # - Combo por linhas com valores editáveis
-# - Registrar pagamento por COMPETÊNCIA (atualiza as linhas existentes)
-# - Sugere última forma de pagamento do cliente (histórico da Base)
-# - Lança comissão em "Despesas_Feminino" no mesmo fluxo (opcional)
-# - Exportação Excel (openpyxl) ou CSV
-# - TOTALMENTE independente do app masculino
+# - Quitar por competência (atualiza linhas existentes)
+# - Lançamento opcional de comissão em Despesas_Feminino
+# - Exportação Excel/CSV
 
 import streamlit as st
 import pandas as pd
@@ -17,20 +17,27 @@ from io import BytesIO
 import pytz
 
 # =========================
-# CONFIGURAÇÃO GERAL (MEIRE)
+# CONFIGURAÇÃO GERAL
 # =========================
 st.set_page_config(page_title="Fiado | Meire (Feminino)", page_icon="💳", layout="wide",
                    initial_sidebar_state="expanded")
 st.title("💅💳 Controle de Fiado — Registro da Meire (Feminino)")
 
-# Defina no secrets.toml:
-# SHEET_ID_MEIRE = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-SHEET_ID = st.secrets["SHEET_ID_MEIRE"]
+# ---------- Fallbacks de planilha ----------
+DEFAULT_SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"  # TROQUE se a planilha da Meire for outra
+DEFAULT_SHEET_URL = None  # opcional: cole a URL oficial se preferir abrir por URL
 
+SHEET_ID = st.secrets.get("SHEET_ID_MEIRE", DEFAULT_SHEET_ID)
+PLANILHA_URL = st.secrets.get("PLANILHA_URL_MEIRE", DEFAULT_SHEET_URL)
+
+if "SHEET_ID_MEIRE" not in st.secrets and "PLANILHA_URL_MEIRE" not in st.secrets:
+    st.warning("Usando ID/URL padrão definidos no código (SHEET_ID_MEIRE/PLANILHA_URL_MEIRE não encontrados em secrets).")
+
+# ---------- Abas do feminino ----------
 ABA_BASE = "Base de Dados Feminino"
 ABA_LANC = "Fiado_Lancamentos_Feminino"
 ABA_PAGT = "Fiado_Pagamentos_Feminino"
-ABA_DESP = "Despesas_Feminino"   # onde vai a comissão
+ABA_DESP = "Despesas_Feminino"
 
 TZ = pytz.timezone("America/Sao_Paulo")
 DATA_FMT = "%d/%m/%Y"
@@ -38,7 +45,7 @@ DATA_FMT = "%d/%m/%Y"
 BASE_COLS_MIN = ["Data","Serviço","Valor","Conta","Cliente","Combo","Funcionário","Fase","Tipo","Período"]
 EXTRA_COLS    = ["StatusFiado","IDLancFiado","VencimentoFiado","DataPagamento"]
 
-# ajuste (edite os valores padrão do feminino, se quiser)
+# valores padrão (ajuste se quiser)
 VALORES_PADRAO = {
     "Escova": 35.0, "Progressiva": 150.0, "Designer de Henna": 30.0,
     "Manicure": 25.0, "Pedicure": 30.0, "Pé/Mão": 50.0,
@@ -47,15 +54,29 @@ VALORES_PADRAO = {
 FUNCIONARIOS = ["Meire", "Funcionária 2", "Funcionária 3"]
 
 # =========================
-# Conexão e helpers
+# Conexão + checagem
 # =========================
 @st.cache_resource
-def conectar_sheets():
+def open_spreadsheet():
     info = st.secrets["GCP_SERVICE_ACCOUNT"]
     scopes = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(SHEET_ID)
+
+    if PLANILHA_URL:
+        ss = gc.open_by_url(PLANILHA_URL)
+    else:
+        ss = gc.open_by_key(SHEET_ID)
+    return ss
+
+def show_connection_banner(ss):
+    try:
+        title = ss.title
+        wsnames = [ws.title for ws in ss.worksheets()]
+        st.success(f"Conectado em: **{title}**")
+        st.caption("Abas disponíveis: " + ", ".join(wsnames))
+    except Exception as e:
+        st.error(f"Não foi possível ler título/abas da planilha: {e}")
 
 def garantir_aba(ss, nome, cols):
     try:
@@ -74,14 +95,12 @@ def garantir_base_cols(ss):
     for c in BASE_COLS_MIN + EXTRA_COLS:
         if c not in df.columns:
             df[c] = ""
-    # reordena, mantendo colunas extras ao final
     df = df[[*BASE_COLS_MIN, *EXTRA_COLS, *[c for c in df.columns if c not in BASE_COLS_MIN+EXTRA_COLS]]]
     ws.clear()
     set_with_dataframe(ws, df)
     return ws
 
 def garantir_aba_despesas(ss):
-    """Garante a aba 'Despesas_Feminino' com colunas mínimas."""
     cols_min = ["Data","Prestador","Descrição","Valor","Forma de Pagamento"]
     ws = garantir_aba(ss, ABA_DESP, cols_min)
     headers = ws.row_values(1) or cols_min
@@ -89,13 +108,15 @@ def garantir_aba_despesas(ss):
 
 @st.cache_data
 def carregar_tudo():
-    ss = conectar_sheets()
+    ss = open_spreadsheet()
+    show_connection_banner(ss)  # feedback ao usuário
+
     ws_base = garantir_base_cols(ss)
     ws_lanc = garantir_aba(ss, ABA_LANC,
         ["IDLanc","DataAtendimento","Cliente","Combo","Servicos","ValorTotal","Vencimento","Funcionario","Fase","Tipo","Periodo"])
     ws_pagt = garantir_aba(ss, ABA_PAGT,
         ["IDPagamento","IDLanc","DataPagamento","Cliente","FormaPagamento","ValorPago","Obs"])
-    garantir_aba_despesas(ss)  # só para existir
+    garantir_aba_despesas(ss)
 
     df_base = get_as_dataframe(ws_base, evaluate_formulas=True, header=0).dropna(how="all")
     df_lanc = get_as_dataframe(ws_lanc, evaluate_formulas=True, header=0).dropna(how="all")
@@ -114,13 +135,13 @@ def carregar_tudo():
     return df_base, df_lanc, df_pagt, clientes, combos, servs, contas
 
 def salvar_df(nome_aba, df):
-    ss = conectar_sheets()
+    ss = open_spreadsheet()
     ws = ss.worksheet(nome_aba)
     ws.clear()
     set_with_dataframe(ws, df)
 
 def append_row(nome_aba, vals):
-    ss = conectar_sheets()
+    ss = open_spreadsheet()
     ss.worksheet(nome_aba).append_row(vals, value_input_option="USER_ENTERED")
 
 def gerar_id(prefixo):
@@ -150,11 +171,7 @@ def ultima_forma_pagto_cliente(df_base, cliente):
     return str(df.iloc[0]["Conta"]) if not df.empty else None
 
 def inserir_despesas_lote(linhas_despesas):
-    """
-    linhas_despesas: lista de dicts c/ chaves:
-      Data, Prestador, Descrição, Valor, Forma de Pagamento
-    """
-    ss = conectar_sheets()
+    ss = open_spreadsheet()
     ws, headers = garantir_aba_despesas(ss)
 
     def pega_col(nome_alvo):
@@ -206,7 +223,7 @@ if acao == "➕ Lançar fiado":
     with c2:
         data_atend = st.date_input("Data do atendimento", value=date.today())
         venc = st.date_input("Vencimento (opcional)", value=date.today())
-        fase = st.text_input("Fase", value="Dono (sozinha)")  # ajuste se necessário
+        fase = st.text_input("Fase", value="Dono (sozinha)")
         tipo = st.selectbox("Tipo", ["Serviço", "Produto"], index=0)
         periodo = st.selectbox("Período (opcional)", ["", "Manhã", "Tarde", "Noite"], index=0)
 
@@ -241,7 +258,7 @@ if acao == "➕ Lançar fiado":
                     "DataPagamento": ""
                 })
 
-            ss = conectar_sheets()
+            ss = open_spreadsheet()
             ws_base = ss.worksheet(ABA_BASE)
             dfb = get_as_dataframe(ws_base, evaluate_formulas=True, header=0).dropna(how="all")
             for c in BASE_COLS_MIN + EXTRA_COLS:
@@ -269,12 +286,11 @@ elif acao == "💰 Registrar pagamento":
         cliente_sel = st.selectbox("Cliente com fiado em aberto", options=[""] + clientes_abertos, index=0)
 
     ultima = ultima_forma_pagto_cliente(df_base, cliente_sel) if cliente_sel else None
-    lista_contas = (["Pix", "Dinheiro", "Cartão", "Transferência", "Outro"])
+    lista_contas = ["Pix", "Dinheiro", "Cartão", "Transferência", "Outro"]
     default_idx = lista_contas.index(ultima) if (ultima in lista_contas) else 0
     with colc2:
         forma_pag = st.selectbox("Forma de pagamento (quitação)", options=lista_contas, index=default_idx)
 
-    # IDs do cliente com rótulo amigável
     ids_opcoes = []
     if cliente_sel:
         grupo_cli = df_abertos[df_abertos["Cliente"] == cliente_sel].copy()
@@ -346,15 +362,12 @@ elif acao == "💰 Registrar pagamento":
         st.caption("Resumo por serviço selecionado:")
         st.dataframe(resumo_srv, use_container_width=True, hide_index=True)
 
-        # ===== BLOCO DE COMISSÃO =====
+        # comissão
         st.markdown("---")
         funcs = subset["Funcionário"].dropna().astype(str).unique().tolist()
-        # Por padrão, ativa se MEIRE estiver nas linhas quitadas
         sugere_on = any(f.lower() == "meire" for f in funcs)
         registrar_comissao = st.checkbox("Registrar comissão na aba Despesas_Feminino agora", value=sugere_on)
 
-        # Data de referência: se todas as linhas do funcionário forem do mesmo dia, usa a data do fiado;
-        # caso contrário, usa a data do pagamento.
         subset["__DataAtend"] = pd.to_datetime(subset["Data"], format=DATA_FMT, errors="coerce").dt.date
         ref_date_por_func = {}
         for f in funcs:
@@ -395,7 +408,7 @@ elif acao == "💰 Registrar pagamento":
 
     disabled_btn = not (cliente_sel and id_selecionados and forma_pag)
     if st.button("Registrar pagamento", use_container_width=True, disabled=disabled_btn):
-        ss = conectar_sheets()
+        ss = open_spreadsheet()
         ws_base = ss.worksheet(ABA_BASE)
         dfb = get_as_dataframe(ws_base, evaluate_formulas=True, header=0).dropna(how="all")
 
@@ -411,7 +424,6 @@ elif acao == "💰 Registrar pagamento":
             subset_all["Valor"] = pd.to_numeric(subset_all["Valor"], errors="coerce").fillna(0)
             total_pago = float(subset_all["Valor"].sum())
 
-            # Atualiza no lugar (COMPETÊNCIA)
             dfb.loc[mask, "Conta"] = forma_pag
             dfb.loc[mask, "StatusFiado"] = "Pago"
             dfb.loc[mask, "VencimentoFiado"] = ""
@@ -432,12 +444,9 @@ elif acao == "💰 Registrar pagamento":
                 ],
             )
 
-            # Lança despesas de comissão (se habilitado)
             if registrar_comissao and bloco_comissao:
                 linhas = []
                 for func, dados in bloco_comissao.items():
-                    # Se quiser impedir comissão para a própria Meire, ajuste aqui:
-                    # if func.strip().lower() == "meire": continue
                     if float(dados.get("Valor", 0) or 0) <= 0:
                         continue
                     linhas.append(dados)
