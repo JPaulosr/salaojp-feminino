@@ -203,7 +203,6 @@ df = carregar_dados()
 df_status = carregar_status_df()
 
 # --- Status automático (sem botão) ---
-# Calcula status com base em TODA a base (recência de 90 dias)
 hoje = pd.Timestamp.today().normalize()
 ultimos = df.groupby("Cliente")["Data"].max().reset_index()
 ultimos["DiasDesde"] = (hoje - ultimos["Data"]).dt.days
@@ -212,26 +211,48 @@ status_map = dict(zip(ultimos["Cliente"], ultimos["StatusNovo"]))
 try:
     _alterados = atualizar_status_clientes_batch(status_map)
     if _alterados > 0:
-        # re-carrega cache local de status se algo mudou
         st.cache_data.clear()
         df_status = carregar_status_df()
 except Exception:
-    # Mantém a página funcionando mesmo se não conseguir gravar
     pass
 
 # =============================
-# Filtro por Ano
+# Filtro por Ano (mantém o ano atual e a última escolha)
 # =============================
 anos = sorted(df["Ano"].unique().tolist())
-ano_escolhido = st.selectbox("📅 Selecione o ano", ["Todos"] + anos, index=0)
+ano_atual = pd.Timestamp.today().year
+# garante que o ano atual esteja na lista de opções
+if ano_atual not in anos:
+    anos.append(ano_atual)
+    anos = sorted(anos)
 
-# Máscara FIADO (não entra em receita)
+opcoes_ano = ["Todos"] + anos
+
+# inicia sessão com ano atual no primeiro acesso
+if "ano_selecionado" not in st.session_state:
+    st.session_state["ano_selecionado"] = ano_atual
+
+# se a sessão tiver um valor que não existe nas opções, cai para ano atual
+valor_inicial = st.session_state["ano_selecionado"]
+if valor_inicial not in opcoes_ano:
+    valor_inicial = ano_atual
+
+ano_escolhido = st.selectbox(
+    "📅 Selecione o ano",
+    opcoes_ano,
+    index=opcoes_ano.index(valor_inicial)
+)
+# atualiza a sessão ao mudar
+st.session_state["ano_selecionado"] = ano_escolhido
+
+# =============================
+# Máscara FIADO e base filtrada por ano
+# =============================
 if "Conta" in df.columns:
     mask_fiado_full = df["Conta"].fillna("").astype(str).str.strip().str.lower().eq("fiado")
 else:
     mask_fiado_full = pd.Series(False, index=df.index)
 
-# Base filtrada por ano (para visões de receita e fiado)
 if ano_escolhido == "Todos":
     df_base = df.copy()
 else:
@@ -257,13 +278,13 @@ c2.metric("✅ Ativas", ativos)
 c3.metric("🚫 Ignoradas", ignorados)
 c4.metric("🚩 Inativas", inativos)
 
-# Limpa nomes genéricos (em todas as visões que serão usadas)
+# Limpa nomes genéricos
 ban = {"boliviano", "brasileiro", "menino", "menino boliviano"}
 for _df in (df_base, df_receita, df_fiado):
     _df.drop(_df[_df["Cliente"].astype(str).str.lower().str.strip().isin(ban)].index, inplace=True)
 
 # =============================
-# Resultado por cliente (ano filtrado)
+# Receita total por cliente (ano filtrado)
 # =============================
 ranking = (df_receita.groupby("Cliente")["ValorNum"].sum()
            .reset_index().rename(columns={"ValorNum": "Valor"})
@@ -277,7 +298,7 @@ busca = st.text_input("🔎 Filtrar por nome").lower().strip()
 rank_view = ranking[ranking["Cliente"].str.lower().str.contains(busca)] if busca else ranking
 st.dataframe(rank_view[["Cliente", "Valor Formatado"]], use_container_width=True)
 
-# Top 5 (ano filtrado)
+# Top 5
 st.subheader("🏆 Top 5 Clientes por Receita")
 top5 = ranking.head(5)
 fig_top = px.bar(
@@ -294,7 +315,6 @@ st.plotly_chart(fig_top, use_container_width=True)
 # =============================
 st.subheader("🗓️ Resultado por cliente por ano (sem fiado)")
 
-# Usa toda a base (para ver a evolução multi-anos), mas SEM fiado
 df_sem_fiado = df[~mask_fiado_full].copy()
 df_sem_fiado = df_sem_fiado[~df_sem_fiado["Cliente"].astype(str).str.lower().str.strip().isin(ban)]
 
@@ -303,13 +323,11 @@ tabela_cliente_ano = (df_sem_fiado
     .reset_index()
     .sort_values(["Cliente", "Ano"]))
 
-# Tabela pivotada para leitura rápida
 pivot_cliente_ano = tabela_cliente_ano.pivot(index="Cliente", columns="Ano", values="ValorNum").fillna(0.0)
 pivot_fmt = pivot_cliente_ano.applymap(lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
 
 st.dataframe(pivot_fmt, use_container_width=True)
 
-# Gráfico opcional: escolhe um cliente para ver evolução por ano
 if not tabela_cliente_ano.empty:
     st.markdown("**Evolução por ano (selecione uma cliente):**")
     clientes_lista = sorted(tabela_cliente_ano["Cliente"].unique().tolist())
@@ -401,5 +419,4 @@ if not ranking.empty:
     cliente_escolhido = st.selectbox("📌 Escolha uma cliente", ranking["Cliente"].tolist())
     if st.button("➡ Ver detalhes"):
         st.session_state["cliente"] = cliente_escolhido
-        # Ajuste o caminho da página se você tiver uma versão específica feminina
         st.switch_page("pages/2_DetalhesCliente.py")
