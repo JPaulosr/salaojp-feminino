@@ -3,7 +3,7 @@
 
 import streamlit as st
 import pandas as pd
-import gspread, json, os, pytz, unicodedata, requests, random, string
+import gspread, json, os, pytz, unicodedata, requests, random, string, re
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from gspread.utils import rowcol_to_a1
@@ -23,7 +23,7 @@ DATA_FMT = "%d/%m/%Y"; HORA_FMT = "%H:%M:%S"
 PHOTO_FALLBACK_URL = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
 FOTO_COL_CANDIDATES = ["link_foto","foto","imagem","url_foto","foto_link","link","image","foto_url"]
 
-# Telegram (pode mover para secrets; há fallback)
+# Telegram
 TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE")
 CHAT_ID_JPAULO = st.secrets.get("TELEGRAM_CHAT_ID_JPAULO", "493747253")
 CHAT_ID_FEMININO = st.secrets.get("TELEGRAM_CHAT_ID_FEMININO", "-1002965378062")
@@ -57,12 +57,12 @@ def send_tg_msg(text):
         st.warning(f"Falha Telegram: {e}")
 
 def _telegram_photo(chat_id, photo_url, caption):
-    """Tenta enviar a foto; se falhar, envia só o texto."""
+    """Envia foto via JSON; se falhar, envia só o texto."""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-            data={"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"},
-            timeout=10
+            json={"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"},
+            timeout=12
         )
         if r.status_code != 200:
             # fallback para texto
@@ -200,6 +200,32 @@ def preco_sugerido(servico):
         print("preco_sugerido erro:", e)
     return None
 
+def normalize_photo_url(u: str) -> str:
+    """Converte links do Google Drive de compartilhamento em links diretos para o Telegram."""
+    if not isinstance(u, str) or not u:
+        return PHOTO_FALLBACK_URL
+    u = u.strip()
+    # formatos aceitos pelo Telegram: http(s) público
+    # 1) https://drive.google.com/file/d/<ID>/view?usp=sharing  -> uc?export=view&id=<ID>
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)/", u)
+    if m:
+        file_id = m.group(1)
+        return f"https://drive.google.com/uc?export=view&id={file_id}"
+    # 2) https://drive.google.com/open?id=<ID>
+    m = re.search(r"drive\.google\.com/(?:open|uc)\?id=([^&]+)", u)
+    if m:
+        file_id = m.group(1)
+        return f"https://drive.google.com/uc?export=view&id={file_id}"
+    # 3) novo viewer thumbnail estável (às vezes carrega mais rápido)
+    m = re.search(r"drive\.google\.com/uc\?export=view&id=([^&]+)", u)
+    if m:
+        return u
+    # 4) lh3.googleusercontent.com/d/<ID>=s800 etc. — já é direto
+    if "lh3.googleusercontent.com" in u:
+        return u
+    # outros hosts (Cloudinary, etc.) – retorna como está
+    return u
+
 def foto_do_cliente(cliente):
     """Busca no 'clientes_status_feminino' a URL da foto; senão, retorna fallback."""
     if not cliente:
@@ -220,7 +246,7 @@ def foto_do_cliente(cliente):
                 if c in df.columns:
                     u = str(r.get(c, "")).strip()
                     if u.startswith(("http://","https://")):
-                        return u
+                        return normalize_photo_url(u)
     except Exception as e:
         print("foto_do_cliente erro:", e)
     return PHOTO_FALLBACK_URL
@@ -319,7 +345,7 @@ if acao.startswith("➕"):
         df_ag = pd.concat([df_ag, pd.DataFrame([linha])], ignore_index=True)
         salvar_df(ABA_AGENDAMENTO, df_ag)
 
-        foto_url = foto_do_cliente(cliente_final)
+        foto_url = foto_do_cliente(cliente_final) or PHOTO_FALLBACK_URL
         det = ""
         if itens_combo:
             linhas = [f"   • {it['servico']}: R$ {0 if (it['valor'] in (None,'')) else it['valor']:.2f}".replace(".", ",")
@@ -338,8 +364,8 @@ if acao.startswith("➕"):
             f"🏷️ <b>ID:</b> {ida}"
             f"{det}"
         )
-        # Envia com foto da cliente
-        send_tg_photo(foto_url or PHOTO_FALLBACK_URL, caption)
+        # Envia com foto da cliente (com conversão de Drive → direto)
+        send_tg_photo(foto_url, caption)
         st.success("Agendado e notificado com sucesso ✅")
 
 # ---------- 2) CONFIRMAR ----------
@@ -352,15 +378,10 @@ elif acao.startswith("✅"):
         em_aberto = df_ag[df_ag["Status"] == "Agendado"].copy()
 
         # Normalização de tipos -> previne erro do data_editor
-        # Texto
         for col in ["IDAgenda","Data","Hora","Cliente","Serviço","Funcionário","Conta","Combo","Observação","Status","Criado_em","Atendido_em","ItensComboJSON"]:
-            if col in em_aberto.columns:
-                em_aberto[col] = em_aberto[col].astype(str)
-
-        # Número
+            if col in em_aberto.columns: em_aberto[col] = em_aberto[col].astype(str)
         em_aberto["Valor"] = pd.to_numeric(em_aberto.get("Valor", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
 
-        # Coluna de seleção
         em_aberto.insert(0, "Selecionar", False)
 
         st.caption("Edite antes de confirmar. (Quando houver combo, os itens gravados serão usados.)")
@@ -401,7 +422,6 @@ elif acao.startswith("✅"):
                         hh = 9
                     periodo = periodo_por_hora(hh)
 
-                    # Se tiver ItensComboJSON => lançar 1 linha por item
                     itens = []
                     try:
                         if str(row["ItensComboJSON"]).strip():
@@ -446,18 +466,15 @@ elif acao.startswith("✅"):
 
                     ids.append(row["IDAgenda"])
 
-                # append base
                 df_base = pd.concat([df_base, pd.DataFrame(novos)], ignore_index=True)
                 salvar_df(ABA_DADOS_FEM, df_base)
 
-                # atualizar agenda
                 df_ag = carregar_df(ABA_AGENDAMENTO)
                 agora = tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
                 df_ag.loc[df_ag["IDAgenda"].isin(ids), "Status"] = "Atendido"
                 df_ag.loc[df_ag["IDAgenda"].isin(ids), "Atendido_em"] = agora
                 salvar_df(ABA_AGENDAMENTO, df_ag)
 
-                # notificação (foto por cliente)
                 for _, row in selecionar.iterrows():
                     foto = foto_do_cliente(str(row["Cliente"]).strip())
                     caption = card_confirmacao(
