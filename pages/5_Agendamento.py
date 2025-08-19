@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 14_Agendamento.py — Agenda Feminino com foto, combos editáveis e cards no Telegram (corrigido)
+# 14_Agendamento.py — Agenda Feminino com foto, combos editáveis e cards no Telegram
 
 import streamlit as st
 import pandas as pd
@@ -21,6 +21,7 @@ TZ = "America/Sao_Paulo"
 DATA_FMT = "%d/%m/%Y"; HORA_FMT = "%H:%M:%S"
 
 PHOTO_FALLBACK_URL = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
+# nomes possíveis para a coluna de foto (comparação com normalização)
 FOTO_COL_CANDIDATES = ["link_foto","foto","imagem","url_foto","foto_link","link","image","foto_url"]
 
 # Telegram
@@ -75,7 +76,7 @@ def normalize_photo_url(u: str) -> str:
         file_id = m.group(1)
         return f"https://drive.google.com/uc?export=view&id={file_id}"
 
-    # 3) já direto (lh3.googleusercontent.com etc.)
+    # 3) já direto (Cloudinary, lh3.googleusercontent etc.)
     return u
 
 def check_url_ok(url: str) -> bool:
@@ -97,7 +98,7 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     send_photo_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     send_text_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    # 1) Tenta direto por URL (se estiver pública)
+    # 1) Tenta direto por URL
     try:
         r = requests.post(
             send_photo_url,
@@ -109,7 +110,7 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     except Exception:
         pass
 
-    # 2) Tenta baixar e enviar como arquivo
+    # 2) Baixa e envia como arquivo
     try:
         if check_url_ok(photo_url):
             img = requests.get(photo_url, timeout=10).content
@@ -121,7 +122,7 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     except Exception:
         pass
 
-    # 3) Fallback: só texto
+    # 3) Fallback texto
     try:
         requests.post(send_text_url, json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML"}, timeout=10)
     except Exception:
@@ -249,32 +250,59 @@ def preco_sugerido(servico):
         print("preco_sugerido erro:", e)
     return None
 
-def foto_do_cliente(cliente):
-    """Busca no 'clientes_status_feminino' a URL da foto; senão, retorna fallback."""
+def foto_do_cliente(cliente: str) -> str:
+    """
+    Busca a URL da foto do cliente na aba 'clientes_status_feminino'.
+    Identifica a coluna de foto por normalização (case-insensitive / acentos).
+    Normaliza links do Drive para visualização direta. Se não achar, usa fallback.
+    """
+    def _norm(s: str) -> str:
+        if not isinstance(s, str): return ""
+        return "".join(ch for ch in unicodedata.normalize("NFKD", s.strip().lower()) if not unicodedata.combining(ch))
+
     if not cliente:
         return PHOTO_FALLBACK_URL
+
     try:
         df = carregar_df(ABA_STATUS_FEM)
-        if df.empty: return PHOTO_FALLBACK_URL
+        if df.empty:
+            return PHOTO_FALLBACK_URL
+
+        # coluna do nome (Cliente / Nome / Nome_Cliente...)
         nome_col = None
-        for c in df.columns:
-            if norm(c) in ("cliente","nome","nome_cliente"):
-                nome_col = c; break
-        if not nome_col: return PHOTO_FALLBACK_URL
-        df["_k"] = df[nome_col].astype(str).apply(norm)
-        row = df[df["_k"] == norm(cliente)].head(1)
-        if not row.empty:
-            r = row.iloc[0]
-            for c in FOTO_COL_CANDIDATES:
-                if c in df.columns:
-                    u = str(r.get(c, "")).strip()
-                    if u.startswith(("http://","https://")):
-                        url = normalize_photo_url(u)
-                        # Se não for acessível publicamente, devolve fallback (envio por arquivo ainda tentará)
-                        return url if check_url_ok(url) else url
+        for col in df.columns:
+            if _norm(col) in ("cliente","nome","nome_cliente"):
+                nome_col = col
+                break
+        if not nome_col:
+            return PHOTO_FALLBACK_URL
+
+        # coluna da foto (ex.: "Foto", "foto", "Imagem"...)
+        foto_col = None
+        cand_norm = {_norm(x) for x in FOTO_COL_CANDIDATES}
+        for col in df.columns:
+            if _norm(col) in cand_norm:
+                foto_col = col
+                break
+        if not foto_col:
+            return PHOTO_FALLBACK_URL
+
+        # procura a linha do cliente
+        df["_k"] = df[nome_col].astype(str).apply(_norm)
+        row = df[df["_k"] == _norm(cliente)].head(1)
+        if row.empty:
+            return PHOTO_FALLBACK_URL
+
+        url = str(row.iloc[0][foto_col]).strip()
+        if not url.startswith(("http://","https://")):
+            return PHOTO_FALLBACK_URL
+
+        url = normalize_photo_url(url)
+        return url or PHOTO_FALLBACK_URL
+
     except Exception as e:
         print("foto_do_cliente erro:", e)
-    return PHOTO_FALLBACK_URL
+        return PHOTO_FALLBACK_URL
 
 # =========================
 # UI
@@ -292,7 +320,7 @@ if acao.startswith("➕"):
     hora_ag = cB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
     funcionario = cC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
-    # Cliente: somente cadastrados
+    # Cliente: somente cadastrados (base + status feminino)
     clientes_opts = clientes_existentes()
     if not clientes_opts:
         st.error("Nenhum cliente encontrado. Cadastre clientes em 'clientes_status_feminino' ou na Base.")
@@ -319,7 +347,7 @@ if acao.startswith("➕"):
 
     obs = st.text_area("Observação (opcional)")
 
-    # Itens do combo quando combo existir (edita valores)
+    # Itens do combo quando combo existir (edite os valores)
     itens_combo = []
     if combo:
         raw = [x.strip() for x in combo.split("+") if x.strip()]
@@ -389,7 +417,6 @@ if acao.startswith("➕"):
             f"🏷️ <b>ID:</b> {ida}"
             f"{det}"
         )
-        # Envia com foto da cliente (com normalização + upload se necessário)
         send_tg_photo(foto_url, caption)
         st.success("Agendado e notificado com sucesso ✅")
 
