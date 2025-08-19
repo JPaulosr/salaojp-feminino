@@ -1,4 +1,4 @@
-# 11_Adicionar_Atendimento.py — VERSÃO FEMININO
+# 11_Adicionar_Atendimento.py — VERSÃO FEMININO COMPLETA
 import streamlit as st
 import pandas as pd
 import gspread
@@ -39,8 +39,48 @@ COLS_PAG_EXTRAS = [
     "FormaPagDetalhe", "PagamentoID"
 ]
 
-# Funcionários FEM (ajuste aqui se necessário)
+# Funcionárias FEM (ajuste aqui se necessário)
 FUNCIONARIOS_FEM = ["Daniela", "Meire"]
+
+# =========================
+# TELEGRAM (IDs que você me passou)
+# =========================
+TELEGRAM_TOKEN_CONST = "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE"
+TELEGRAM_CHAT_ID_JPAULO_CONST = "493747253"
+TELEGRAM_CHAT_ID_VINICIUS_CONST = "-1001234567890"
+TELEGRAM_CHAT_ID_FEMININO_CONST = "-1002965378062"  # Salão JP Feminino
+
+def _get_secret(name: str, default: str | None = None) -> str | None:
+    try:
+        val = st.secrets.get(name)
+        val = (val or "").strip()
+        if val:
+            return val
+    except Exception:
+        pass
+    return (default or "").strip() or None
+
+def _get_token() -> str | None:
+    return _get_secret("TELEGRAM_TOKEN", TELEGRAM_TOKEN_CONST)
+
+def _get_chat_id_jp() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_JPAULO", TELEGRAM_CHAT_ID_JPAULO_CONST)
+
+def _get_chat_id_vini() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_VINICIUS", TELEGRAM_CHAT_ID_VINICIUS_CONST)
+
+def _get_chat_id_fem() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_FEMININO", TELEGRAM_CHAT_ID_FEMININO_CONST)
+
+def _check_tg_ready(token: str | None, chat_id: str | None) -> bool:
+    return bool((token or "").strip() and (chat_id or "").strip())
+
+def _chat_id_por_func(funcionario: str) -> str | None:
+    if funcionario == "Vinicius":
+        return _get_chat_id_vini()
+    if funcionario in FUNCIONARIOS_FEM:
+        return _get_chat_id_fem()
+    return _get_chat_id_jp()
 
 # =========================
 # UTILS
@@ -80,11 +120,13 @@ def contains_cartao(s: str) -> bool:
     return any(k in x for k in MAQ)
 
 def is_nao_cartao(conta: str) -> bool:
+    """True se a forma de pagamento NÃO for cartão (ex.: PIX, Dinheiro, Transferência)."""
     s = unicodedata.normalize("NFKD", (conta or "")).encode("ascii","ignore").decode("ascii").lower()
     tokens = {"pix", "dinheiro", "carteira", "cash", "especie", "espécie", "transfer", "transferencia", "transferência", "ted", "doc"}
     return any(t in s for t in tokens)
 
 def default_card_flag(conta: str) -> bool:
+    """Padrão do interruptor 'Tratar como cartão?' – desliga em PIX/transferência/dinheiro."""
     if is_nao_cartao(conta):
         return False
     return contains_cartao(conta)
@@ -127,6 +169,7 @@ def _cmap(ws):
     return cmap
 
 def format_extras_numeric(ws):
+    """Força formato numérico/percentual nas colunas extras (evita virar '07:12:00')."""
     cmap = _cmap(ws)
     def fmt(name, ntype, pattern):
         c = cmap.get(_norm_key(name))
@@ -197,47 +240,8 @@ def carregar_fotos_mapa():
 FOTOS = carregar_fotos_mapa()
 
 # =========================
-# TELEGRAM
+# TELEGRAM – envio
 # =========================
-TELEGRAM_TOKEN_CONST = "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE"
-TELEGRAM_CHAT_ID_JPAULO_CONST = "493747253"
-TELEGRAM_CHAT_ID_VINICIUS_CONST = "-1002953102982"
-# Canal FEMININO (ajuste se precisar)
-TELEGRAM_CHAT_ID_FEMININO_CONST = "-1001234567890"
-
-def _get_secret(name: str, default: str | None = None) -> str | None:
-    try:
-        val = st.secrets.get(name)
-        val = (val or "").strip()
-        if val:
-            return val
-    except Exception:
-        pass
-    return (default or "").strip() or None
-
-def _get_token() -> str | None:
-    return _get_secret("TELEGRAM_TOKEN", TELEGRAM_TOKEN_CONST)
-
-def _get_chat_id_jp() -> str | None:
-    return _get_secret("TELEGRAM_CHAT_ID_JPAULO", TELEGRAM_CHAT_ID_JPAULO_CONST)
-
-def _get_chat_id_vini() -> str | None:
-    return _get_secret("TELEGRAM_CHAT_ID_VINICIUS", TELEGRAM_CHAT_ID_VINICIUS_CONST)
-
-def _get_chat_id_fem() -> str | None:
-    # você pode criar um secret TELEGRAM_CHAT_ID_FEMININO; senão usa o default acima
-    return _get_secret("TELEGRAM_CHAT_ID_FEMININO", TELEGRAM_CHAT_ID_FEMININO_CONST)
-
-def _check_tg_ready(token: str | None, chat_id: str | None) -> bool:
-    return bool((token or "").strip() and (chat_id or "").strip())
-
-def _chat_id_por_func(funcionario: str) -> str | None:
-    if funcionario == "Vinicius":
-        return _get_chat_id_vini()
-    if funcionario in FUNCIONARIOS_FEM:
-        return _get_chat_id_fem()
-    return _get_chat_id_jp()
-
 def tg_send(text: str, chat_id: str | None = None) -> bool:
     token = _get_token()
     chat = chat_id or _get_chat_id_jp()
@@ -247,7 +251,7 @@ def tg_send(text: str, chat_id: str | None = None) -> bool:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         r = requests.post(url, json=payload, timeout=30)
-        js = r.json()
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
         return bool(r.ok and js.get("ok"))
     except Exception:
         return False
@@ -261,11 +265,13 @@ def tg_send_photo(photo_url: str, caption: str, chat_id: str | None = None) -> b
         url = f"https://api.telegram.org/bot{token}/sendPhoto"
         payload = {"chat_id": chat, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
         r = requests.post(url, data=payload, timeout=30)
-        js = r.json()
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
         if r.ok and js.get("ok"):
             return True
+        # fallback: manda texto
         return tg_send(caption, chat_id=chat)
     except Exception:
+        # fallback: manda texto
         return tg_send(caption, chat_id=chat)
 
 # =========================
@@ -456,7 +462,7 @@ def enviar_card(df_all, cliente, funcionario, data_str, servico=None, valor=None
     foto = FOTOS.get(_norm(cliente))
 
     caption_base = make_card_caption_v2(
-        df_all, cliente, data_str, funcionario, servico_label, valor_total, "-",  # período já vem do resumo
+        df_all, cliente, data_str, funcionario, servico_label, valor_total, "-",
         append_sections=extras_base
     )
     caption_jp = make_card_caption_v2(
@@ -464,10 +470,7 @@ def enviar_card(df_all, cliente, funcionario, data_str, servico=None, valor=None
         append_sections=extras_jp
     )
 
-    # Regras de envio:
-    # - Vinicius: envia para o canal dele e também para JP
-    # - Daniela / Meire (FEM): envia para canal feminino e também para JP
-    # - Outros: envia para JP
+    # VINICIUS: canal dele + JP
     if funcionario == "Vinicius":
         chat_v = _get_chat_id_vini()
         if foto: tg_send_photo(foto, caption_base, chat_id=chat_v)
@@ -477,6 +480,7 @@ def enviar_card(df_all, cliente, funcionario, data_str, servico=None, valor=None
         else:    tg_send(caption_jp, chat_id=chat_jp)
         return
 
+    # FEMININO: canal feminino + JP
     if funcionario in FUNCIONARIOS_FEM:
         chat_fem = _get_chat_id_fem()
         if foto: tg_send_photo(foto, caption_base, chat_id=chat_fem)
@@ -486,7 +490,7 @@ def enviar_card(df_all, cliente, funcionario, data_str, servico=None, valor=None
         else:    tg_send(caption_jp, chat_id=chat_jp)
         return
 
-    # fallback
+    # Fallback (outros): envia para JP
     destino = _chat_id_por_func(funcionario)
     if foto: tg_send_photo(foto, caption_base, chat_id=destino)
     else:    tg_send(caption_base, chat_id=destino)
@@ -810,7 +814,7 @@ if not modo_lote:
                 enviar_card(df_final, cliente, funcionario, data, servico=servico_norm, valor=float(nova["Valor"]), combo="")
 
 # =========================
-# MODO LOTE AVANÇADO (mantido e adaptado)
+# MODO LOTE AVANÇADO
 # =========================
 else:
     st.info("Defina atendimento individual por cliente (misture combos e simples). Também escolha forma de pagamento, período e funcionário para cada um.")
@@ -835,10 +839,11 @@ else:
             st.selectbox(
                 f"Forma de Pagamento de {cli}",
                 list(dict.fromkeys([sug_conta] + contas_existentes +
-                                   ["Carteira", "Pix", "Transferência", "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago"])),
+                                   ["Carteira", "Pix", "Transferência", "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago"]))    ,
                 key=f"conta_{cli}"
             )
 
+            # trava de cartão
             force_off_cli = is_nao_cartao(st.session_state.get(f"conta_{cli}", ""))
 
             st.checkbox(
@@ -849,6 +854,7 @@ else:
                 help=("Desabilitado para PIX/Dinheiro/Transferência." if force_off_cli else None),
             )
 
+            # uso efetivo
             use_card_cli = (not force_off_cli) and bool(st.session_state.get(f"flag_card_{cli}", False))
 
             st.selectbox(f"Período do Atendimento de {cli}", ["Manhã", "Tarde", "Noite"],
