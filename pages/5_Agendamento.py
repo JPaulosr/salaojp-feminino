@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 14_Agendamento.py — Agenda Feminino com foto, combos editáveis e cards no Telegram
+# 14_Agendamento.py — Agenda Feminino com foto, combos editáveis e cards no Telegram (corrigido)
 
 import streamlit as st
 import pandas as pd
@@ -56,27 +56,76 @@ def send_tg_msg(text):
     except Exception as e:
         st.warning(f"Falha Telegram: {e}")
 
-def _telegram_photo(chat_id, photo_url, caption):
-    """Envia foto via JSON; se falhar, envia só o texto."""
+# ----------- FOTO: Normalização + Verificação + Envio robusto -----------
+def normalize_photo_url(u: str) -> str:
+    """Converte links do Google Drive em links diretos quando possível."""
+    if not isinstance(u, str) or not u:
+        return PHOTO_FALLBACK_URL
+    u = u.strip()
+
+    # 1) https://drive.google.com/file/d/<ID>/view?...  -> uc?export=view&id=<ID>
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)/", u)
+    if m:
+        file_id = m.group(1)
+        return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+    # 2) https://drive.google.com/open?id=<ID>  ou uc?id=<ID>
+    m = re.search(r"drive\.google\.com/(?:open|uc)\?[^#]*id=([^&]+)", u)
+    if m:
+        file_id = m.group(1)
+        return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+    # 3) já direto (lh3.googleusercontent.com etc.)
+    return u
+
+def check_url_ok(url: str) -> bool:
+    """HEAD/GET rápido para saber se a URL está acessível publicamente."""
+    try:
+        r = requests.head(url, timeout=6, allow_redirects=True)
+        if r.status_code == 405:  # alguns hosts bloqueiam HEAD
+            r = requests.get(url, timeout=8, stream=True)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _telegram_photo(chat_id: str, photo_url: str, caption: str):
+    """
+    1) Tenta enviar a URL.
+    2) Se falhar, tenta baixar e enviar como arquivo (multipart).
+    3) Se falhar, envia só texto (fallback).
+    """
+    send_photo_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    send_text_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    # 1) Tenta direto por URL (se estiver pública)
     try:
         r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+            send_photo_url,
             json={"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"},
             timeout=12
         )
-        if r.status_code != 200:
-            # fallback para texto
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML"},
-                timeout=10
-            )
+        if r.status_code == 200:
+            return
     except Exception:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML"},
-            timeout=10
-        )
+        pass
+
+    # 2) Tenta baixar e enviar como arquivo
+    try:
+        if check_url_ok(photo_url):
+            img = requests.get(photo_url, timeout=10).content
+            files = {"photo": ("foto.jpg", img, "image/jpeg")}
+            data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+            r2 = requests.post(send_photo_url, data=data, files=files, timeout=15)
+            if r2.status_code == 200:
+                return
+    except Exception:
+        pass
+
+    # 3) Fallback: só texto
+    try:
+        requests.post(send_text_url, json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML"}, timeout=10)
+    except Exception:
+        pass
 
 def send_tg_photo(photo_url, caption):
     for chat_id in (CHAT_ID_FEMININO, CHAT_ID_JPAULO):
@@ -200,32 +249,6 @@ def preco_sugerido(servico):
         print("preco_sugerido erro:", e)
     return None
 
-def normalize_photo_url(u: str) -> str:
-    """Converte links do Google Drive de compartilhamento em links diretos para o Telegram."""
-    if not isinstance(u, str) or not u:
-        return PHOTO_FALLBACK_URL
-    u = u.strip()
-    # formatos aceitos pelo Telegram: http(s) público
-    # 1) https://drive.google.com/file/d/<ID>/view?usp=sharing  -> uc?export=view&id=<ID>
-    m = re.search(r"drive\.google\.com/file/d/([^/]+)/", u)
-    if m:
-        file_id = m.group(1)
-        return f"https://drive.google.com/uc?export=view&id={file_id}"
-    # 2) https://drive.google.com/open?id=<ID>
-    m = re.search(r"drive\.google\.com/(?:open|uc)\?id=([^&]+)", u)
-    if m:
-        file_id = m.group(1)
-        return f"https://drive.google.com/uc?export=view&id={file_id}"
-    # 3) novo viewer thumbnail estável (às vezes carrega mais rápido)
-    m = re.search(r"drive\.google\.com/uc\?export=view&id=([^&]+)", u)
-    if m:
-        return u
-    # 4) lh3.googleusercontent.com/d/<ID>=s800 etc. — já é direto
-    if "lh3.googleusercontent.com" in u:
-        return u
-    # outros hosts (Cloudinary, etc.) – retorna como está
-    return u
-
 def foto_do_cliente(cliente):
     """Busca no 'clientes_status_feminino' a URL da foto; senão, retorna fallback."""
     if not cliente:
@@ -246,7 +269,9 @@ def foto_do_cliente(cliente):
                 if c in df.columns:
                     u = str(r.get(c, "")).strip()
                     if u.startswith(("http://","https://")):
-                        return normalize_photo_url(u)
+                        url = normalize_photo_url(u)
+                        # Se não for acessível publicamente, devolve fallback (envio por arquivo ainda tentará)
+                        return url if check_url_ok(url) else url
     except Exception as e:
         print("foto_do_cliente erro:", e)
     return PHOTO_FALLBACK_URL
@@ -364,7 +389,7 @@ if acao.startswith("➕"):
             f"🏷️ <b>ID:</b> {ida}"
             f"{det}"
         )
-        # Envia com foto da cliente (com conversão de Drive → direto)
+        # Envia com foto da cliente (com normalização + upload se necessário)
         send_tg_photo(foto_url, caption)
         st.success("Agendado e notificado com sucesso ✅")
 
@@ -476,7 +501,7 @@ elif acao.startswith("✅"):
                 salvar_df(ABA_AGENDAMENTO, df_ag)
 
                 for _, row in selecionar.iterrows():
-                    foto = foto_do_cliente(str(row["Cliente"]).strip())
+                    foto = foto_do_cliente(str(row["Cliente"]).strip()) or PHOTO_FALLBACK_URL
                     caption = card_confirmacao(
                         c=str(row["Cliente"]).strip(),
                         s=(str(row["Serviço"]).strip() or f"Combo: {row['Combo']}"),
@@ -485,7 +510,7 @@ elif acao.startswith("✅"):
                         d=str(row["Data"]), h=str(row["Hora"]),
                         obs=str(row["Observação"]).strip(), ida=str(row["IDAgenda"])
                     )
-                    send_tg_photo(foto or PHOTO_FALLBACK_URL, caption)
+                    send_tg_photo(foto, caption)
 
                 send_tg_msg(f"🧾 <b>Resumo</b>: {len(ids)} atendimento(s) confirmado(s) e lançados na Base de Dados Feminino.")
                 st.success(f"{len(ids)} atendimento(s) confirmados, linhas geradas (combo) e cards enviados.")
