@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-# 14_Agendamento.py — Agenda com notificações no Telegram + confirmação em lote
-# Atualização: conexão robusta com secrets (aceita várias chaves) + fallback
+# 14_Agendamento.py — Agenda com notificações no Telegram (com FOTO) + confirmação em lote
+# Atualizações:
+# - Serviço e Combo passam a ser sugeridos a partir da Base de Dados Feminino
+# - Notificação no Telegram envia a FOTO do cliente (se existir); fallback para logo
 
 import streamlit as st
 import pandas as pd
@@ -17,12 +19,18 @@ import pytz, unicodedata, requests, random, string, json, os
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 
 ABA_DADOS_FEM = "Base de Dados Feminino"
-ABA_STATUS_FEM = "clientes_status_feminino"   # opcional
+ABA_STATUS_FEM = "clientes_status_feminino"   # se não existir, o código ignora
 ABA_AGENDAMENTO = "Agendamento"
 
 TZ = "America/Sao_Paulo"
 DATA_FMT = "%d/%m/%Y"
 HORA_FMT = "%H:%M:%S"
+
+# Foto padrão (logo) quando cliente não tem imagem cadastrada
+PHOTO_FALLBACK_URL = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
+
+# Colunas candidatas de foto na planilha de status
+FOTO_COL_CANDIDATES = ["link_foto", "foto", "imagem", "url_foto", "foto_link", "link", "image", "foto_url"]
 
 # --- Telegram via secrets (fallback para hardcode) ---
 TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE")
@@ -54,21 +62,33 @@ def novo_id(prefix="AG"):
     rand = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"{prefix}-{base}-{rand}"
 
-def send_telegram(text: str):
+def send_telegram_message(text: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         for chat_id in (CHAT_ID_FEMININO, CHAT_ID_JPAULO):
             payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
             requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        st.warning(f"Falha ao notificar no Telegram: {e}")
+        st.warning(f"Falha ao enviar mensagem no Telegram: {e}")
+
+def send_telegram_photo(photo_url: str, caption: str):
+    """Envia foto com legenda; se falhar, manda mensagem simples."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        for chat_id in (CHAT_ID_FEMININO, CHAT_ID_JPAULO):
+            payload = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
+            r = requests.post(url, data=payload, timeout=10)
+            # Alguns servidores bloqueiam o HEAD/GET da imagem; se 400, cai pro texto:
+            if r.status_code != 200:
+                send_telegram_message(caption)
+    except Exception:
+        send_telegram_message(caption)
 
 # =========================
-# Conexão Sheets (robusta a diferentes secrets)
+# Conexão Sheets (robusta)
 # =========================
 @st.cache_resource(show_spinner=False)
 def conectar_sheets():
-    # tenta várias chaves nos secrets / env
     cand = (
         st.secrets.get("gcp_service_account") or
         st.secrets.get("gcp_service_account_feminino") or
@@ -82,7 +102,6 @@ def conectar_sheets():
             "gcp_service_account / gcp_service_account_feminino / google_credentials / GCP_SERVICE_ACCOUNT"
         )
     if isinstance(cand, str):
-        # pode vir como string JSON
         cand = json.loads(cand)
 
     scopes = [
@@ -137,6 +156,10 @@ def salvar_df(aba: str, df: pd.DataFrame):
     ws.clear()
     set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
+# -------------------------
+# Dados auxiliares (Clientes, Serviços, Combos, Foto)
+# -------------------------
+@st.cache_data(show_spinner=False)
 def clientes_existentes() -> list:
     nomes = set()
     try:
@@ -157,6 +180,61 @@ def clientes_existentes() -> list:
         pass
     return sorted(nomes, key=lambda s: norm(s))
 
+@st.cache_data(show_spinner=False)
+def servicos_e_combos():
+    """Retorna (servicos:list, combos:list) únicos não vazios a partir da Base Feminino."""
+    servs, combs = [], []
+    try:
+        df = carregar_df(ABA_DADOS_FEM)
+        if not df.empty:
+            if "Serviço" in df.columns:
+                servs = [s for s in df["Serviço"].dropna().astype(str) if s.strip()]
+            if "Combo" in df.columns:
+                combs = [c for c in df["Combo"].dropna().astype(str) if c.strip()]
+    except Exception:
+        pass
+    # normaliza e ordena
+    # Serviço: primeira letra maiúscula; Combo: minúsculo como na base
+    servs_norm = []
+    for s in servs:
+        s = s.strip()
+        s = s[:1].upper() + s[1:] if s else s
+        servs_norm.append(s)
+    uniq_servs = sorted(sorted(set(servs_norm)), key=lambda s: norm(s))
+    uniq_combos = sorted(sorted(set(combs)), key=lambda s: norm(s))
+    return uniq_servs, uniq_combos
+
+def foto_do_cliente(cliente: str) -> str:
+    """Busca URL da foto no clientes_status_feminino (colunas candidatas); fallback para logo."""
+    if not cliente:
+        return PHOTO_FALLBACK_URL
+    try:
+        df = carregar_df(ABA_STATUS_FEM)
+        if df.empty:
+            return PHOTO_FALLBACK_URL
+        # achar coluna do nome
+        nome_col = None
+        for col in df.columns:
+            if norm(col) in ("cliente","nome","nome_cliente"):
+                nome_col = col
+                break
+        if not nome_col:
+            return PHOTO_FALLBACK_URL
+        # filtra pelo nome (case/acentos-insensível)
+        df["_k"] = df[nome_col].astype(str).apply(norm)
+        alvo = norm(cliente)
+        linha = df[df["_k"] == alvo].head(1)
+        if not linha.empty:
+            row = linha.iloc[0]
+            for c in FOTO_COL_CANDIDATES:
+                if c in df.columns:
+                    url = str(row.get(c, "")).strip()
+                    if url and url.lower().startswith(("http://", "https://")):
+                        return url
+    except Exception:
+        pass
+    return PHOTO_FALLBACK_URL
+
 # =========================
 # UI
 # =========================
@@ -171,11 +249,13 @@ acao = st.radio(
 # ---------- 1) AGENDAR ----------
 if acao.startswith("➕"):
     st.subheader("Novo agendamento")
+
     colA, colB, colC = st.columns([1,1,2])
     data_ag = colA.date_input("Data", value=date.today())
     hora_ag = colB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
     funcionario = colC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
+    # Cliente (autocomplete com existentes + campo para novo)
     clientes = clientes_existentes()
     cli_opcoes = ["(digite novo cliente)"] + clientes
     cliente_sel = st.selectbox("Cliente", cli_opcoes, index=1 if clientes else 0)
@@ -184,13 +264,32 @@ if acao.startswith("➕"):
         cliente_txt = st.text_input("Novo cliente")
     cliente_final = (cliente_txt or cliente_sel).strip()
 
+    # Serviços/Combos vindos da base (com opção Outro)
+    servs, combs = servicos_e_combos()
+
     col1, col2 = st.columns([2,1])
-    servico = col1.text_input("Serviço", placeholder="Ex.: Escova, Unha pé+mão, Progressiva…")
+    serv_opcoes = ["(Outro)"] + servs if servs else ["(Outro)"]
+    serv_sel = col1.selectbox("Serviço", serv_opcoes)
+    serv_txt = ""
+    if serv_sel == "(Outro)":
+        serv_txt = col1.text_input("Digite o serviço")
+    servico = (serv_txt or serv_sel).strip()
+    if servico:
+        servico = servico[:1].upper() + servico[1:]  # inicial maiúscula
+
     valor = col2.text_input("Valor (R$)", placeholder="Ex.: 35,00")
+
     col3, col4 = st.columns([1,1])
     conta = col3.text_input("Conta / Forma de pagamento", value="Carteira")
-    combo = col4.text_input("Combo (opcional)", placeholder="Ex.: corte+barba")
-    obs = st.text_area("Observação (opcional)")
+
+    combo_opcoes = ["(Sem combo)"] + combs if combs else ["(Sem combo)"]
+    combo_sel = col4.selectbox("Combo", combo_opcoes, index=0)
+    combo_txt = ""
+    if combo_sel == "(Sem combo)":
+        combo_txt = col4.text_input("Digite o combo (opcional)", placeholder="Ex.: corte+barba")
+    combo = (combo_txt or ("" if combo_sel == "(Sem combo)" else combo_sel)).strip()
+
+    obs = st.text_area("Observação (opcional)", placeholder="Preferências, referências, etc.")
 
     if st.button("Agendar e notificar", type="primary", use_container_width=True):
         if not cliente_final:
@@ -221,18 +320,20 @@ if acao.startswith("➕"):
             df_ag = pd.concat([df_ag, pd.DataFrame([linha])], ignore_index=True)
             salvar_df(ABA_AGENDAMENTO, df_ag)
 
-            msg = (
+            # Telegram com FOTO
+            foto_url = foto_do_cliente(cliente_final)
+            caption = (
                 "📅 <b>Novo agendamento</b>\n"
                 f"👤 <b>Cliente:</b> {cliente_final}\n"
                 f"🧴 <b>Serviço:</b> {servico}\n"
                 f"💳 <b>Conta:</b> {conta}\n"
-                f"💲 <b>Valor:</b> {valor}\n"
+                f"💲 <b>Valor:</b> {valor or '-'}\n"
                 f"🧑‍💼 <b>Funcionário:</b> {funcionario}\n"
                 f"🗓️ <b>Data/Hora:</b> {linha['Data']} {linha['Hora']}\n"
                 f"📝 <b>Obs.:</b> {obs or '-'}\n"
                 f"🏷️ <b>ID:</b> {ida}"
             )
-            send_telegram(msg)
+            send_telegram_photo(foto_url, caption)
             st.success("Agendado e notificado com sucesso ✅")
 
 # ---------- 2) CONFIRMAR ----------
@@ -348,9 +449,10 @@ elif acao.startswith("✅"):
                 df_ag.loc[df_ag["IDAgenda"].isin(ids_atendidos), "Atendido_em"] = agora_txt
                 salvar_df(ABA_AGENDAMENTO, df_ag)
 
-                msg = f"✅ <b>Atendimentos confirmados</b>\n🗂️ {len(ids_atendidos)} registro(s) lançado(s) na Base de Dados Feminino."
-                send_telegram(msg)
-
+                # Telegram (resumo simples)
+                send_telegram_message(
+                    f"✅ <b>Atendimentos confirmados</b>\n🗂️ {len(ids_atendidos)} registro(s) lançado(s) na Base de Dados Feminino."
+                )
                 st.success(f"{len(ids_atendidos)} atendimento(s) confirmados e lançados na base.")
 
 # ---------- 3) EM ABERTO ----------
