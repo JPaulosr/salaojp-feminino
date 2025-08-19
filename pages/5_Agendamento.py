@@ -1,29 +1,29 @@
 # -*- coding: utf-8 -*-
-# 11_Adicionar_Atendimento.py — Feminino (Clientes da Base + Notificação Canal Feminino + JPaulo)
+# 11_Adicionar_Atendimento_Feminino.py — Clientes da "Base de Dados Feminino" + Notificação (Canal Feminino + JPaulo)
 
 import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
-from gspread.utils import rowcol_to_a1
+from gspread_dataframe import get_as_dataframe
 from datetime import datetime
 import pytz, unicodedata, requests
 
 # =========================
 # CONFIG
 # =========================
-SHEET_ID   = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
-ABA_DADOS  = "Base de Dados"
-STATUS_ABA = "clientes_status"
-TZ         = "America/Sao_Paulo"
+SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
+
+ABA_DADOS_FEM = "Base de Dados Feminino"       # <-- usa esta aba para listar clientes e salvar
+STATUS_ABA_FEM = "clientes_status_feminino"    # opcional (para fotos), se existir
+
+TZ          = "America/Sao_Paulo"
 DATA_FMT_BR = "%d/%m/%Y"
 HORA_FMT    = "%H:%M:%S"
 
-# Funcionárias do feminino
-FUNCIONARIAS_FEMININO = {"Meire", "Daniela"}
+FUNCIONARIAS_FEMININO = {"Meire", "Daniela"}   # padrão Meire
 
-# Telegram (use st.secrets em produção)
+# Telegram (mantenha em st.secrets em produção)
 TELEGRAM_TOKEN            = st.secrets.get("TELEGRAM_TOKEN", "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE")
 TELEGRAM_CHAT_ID_JPAULO   = st.secrets.get("TELEGRAM_CHAT_ID_JPAULO", "493747253")
 TELEGRAM_CHAT_ID_FEMININO = st.secrets.get("TELEGRAM_CHAT_ID_FEMININO", "-1002965378062")
@@ -34,7 +34,7 @@ TELEGRAM_CHAT_ID_FEMININO = st.secrets.get("TELEGRAM_CHAT_ID_FEMININO", "-100296
 @st.cache_resource
 def conectar_sheets():
     if "GCP_SERVICE_ACCOUNT" not in st.secrets:
-        st.stop()  # configure as credenciais em st.secrets
+        st.stop()  # configure st.secrets["GCP_SERVICE_ACCOUNT"]
     info = dict(st.secrets["GCP_SERVICE_ACCOUNT"])
     creds = Credentials.from_service_account_info(
         info,
@@ -56,14 +56,13 @@ def _norm(s: str) -> str:
     return "".join(c for c in s if not unicodedata.combining(c))
 
 @st.cache_data(ttl=300)
-def listar_clientes_da_base(gc) -> list[str]:
-    """Retorna lista única (ordenada) de clientes vindo somente da 'Base de Dados'."""
-    ws = abrir_aba(gc, SHEET_ID, ABA_DADOS)
+def listar_clientes_da_base_fem(gc) -> list[str]:
+    """Lista única (ordenada) de clientes, somente da 'Base de Dados Feminino'."""
+    ws = abrir_aba(gc, SHEET_ID, ABA_DADOS_FEM)
     df = get_as_dataframe(ws, evaluate_formulas=True, header=0).dropna(how="all")
     if df.empty or "Cliente" not in df.columns:
         return []
-    vistos = set()
-    saida = []
+    vistos, saida = set(), []
     for nome in df["Cliente"].dropna().astype(str):
         nm = nome.strip()
         if not nm:
@@ -73,6 +72,16 @@ def listar_clientes_da_base(gc) -> list[str]:
             vistos.add(chave)
             saida.append(nm)
     return sorted(saida, key=lambda x: x.casefold())
+
+def append_respeitando_cabecalho(ws, row_dict: dict):
+    """Append sem limpar a aba; respeita o cabeçalho existente."""
+    headers = ws.row_values(1)
+    if not headers:
+        # cria cabeçalho com as chaves informadas na primeira gravação
+        headers = list(row_dict.keys())
+        ws.update('A1', [headers])
+    valores = [row_dict.get(col, "") for col in headers]
+    ws.append_row(valores, value_input_option="USER_ENTERED")
 
 # =========================
 # TELEGRAM
@@ -109,19 +118,19 @@ st.set_page_config(page_title="Adicionar Atendimento — Feminino", layout="wide
 st.title("🖊️ Adicionar Atendimento — Feminino")
 
 gc = conectar_sheets()
-ws_base = abrir_aba(gc, SHEET_ID, ABA_DADOS)
+ws_fem = abrir_aba(gc, SHEET_ID, ABA_DADOS_FEM)
 
-# ---- Formulário
+# ---- Formulário ----
 col1, col2 = st.columns([1,1])
 with col1:
     data_input = st.date_input("Data", value=datetime.now(pytz.timezone(TZ)).date())
 with col2:
-    funcionario = st.selectbox("Funcionário", options=["Meire", "Daniela"], index=0)  # padrão Meire
+    funcionario = st.selectbox("Funcionário", options=["Meire", "Daniela"], index=0)
 
-# Clientes vindos da Base
+# Clientes (somente da Base de Dados Feminino)
 clientes_lista = ["➕ Digitar novo nome"]
 try:
-    base_clientes = listar_clientes_da_base(gc)
+    base_clientes = listar_clientes_da_base_fem(gc)
     if base_clientes:
         clientes_lista += base_clientes
 except Exception:
@@ -147,9 +156,9 @@ with col6:
 
 col7, col8 = st.columns([1,1])
 with col7:
-    hora_inicio  = st.text_input("Hora Início (HH:MM:SS)", value="")
+    hora_inicio = st.text_input("Hora Início (HH:MM:SS)", value="")
 with col8:
-    hora_saida   = st.text_input("Hora Saída (HH:MM:SS)", value="")
+    hora_saida  = st.text_input("Hora Saída (HH:MM:SS)", value="")
 
 combo = st.text_input("Combo (opcional)", placeholder="corte+escova").strip()
 
@@ -175,32 +184,30 @@ if salvar:
         st.stop()
 
     data_br = data_input.strftime(DATA_FMT_BR)
+
+    # Monta linha (campos padrão + compatíveis com a sua planilha)
     row = {
         "Data": data_br,
-        "Serviço": servico,                 # mantém como digitado (minúsculo e/ou '+')
+        "Serviço": servico,                          # mantém como digitado (minúsculo e/ou '+')
         "Valor": valor,
         "Conta": conta,
         "Cliente": cliente,
         "Combo": combo,
-        "Funcionário": funcionario,         # Meire/Daniela
+        "Funcionário": funcionario,
         "Fase": "Dono + funcionário",
         "Tipo": tipo,
-        "Período": data_input.strftime("%m/%Y"),
+        # Em muitas abas femininas o campo "Período" é Manhã/Tarde/Noite; se quiser, adicionamos um select disso
+        "Período": "",
         "Hora Chegada": "",
         "Hora Início": validar_hora(hora_inicio) or "",
         "Hora Saída": validar_hora(hora_saida) or "",
         "Hora Saída do Salão": ""
     }
 
-    # Append na Base
+    # Append respeitando o cabeçalho existente (não limpa a aba e mantém colunas como StatusFiado, etc.)
     try:
-        df_base = get_as_dataframe(ws_base, evaluate_formulas=True, header=0)
-        if df_base is None or df_base.empty:
-            df_base = pd.DataFrame(columns=list(row.keys()))
-        df_out = pd.concat([df_base, pd.DataFrame([row])], ignore_index=True)
-        ws_base.clear()
-        set_with_dataframe(ws_base, df_out)
-        st.success("Atendimento salvo na planilha ✅")
+        append_respeitando_cabecalho(ws_fem, row)
+        st.success("Atendimento salvo na planilha (Base de Dados Feminino) ✅")
     except Exception as e:
         st.error(f"Erro ao salvar na planilha: {e}")
         st.stop()
@@ -212,8 +219,10 @@ if salvar:
 
     try:
         enviar_card(destinos, cliente, servico, valor, data_br, validar_hora(hora_inicio), funcionario)
-        st.success("Notificações enviadas (Feminino/JPaulo) ✅")
+        st.success("Notificações enviadas (Canal Feminino/JPaulo) ✅")
     except Exception as e:
         st.warning(f"Registro salvo, mas falhou o envio do Telegram: {e}")
 
+    # Atualiza lista de clientes e limpa campos
+    st.cache_data.clear()
     st.rerun()
