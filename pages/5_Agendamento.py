@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 # 14_Agendamento.py — Agenda com notificações no Telegram + confirmação em lote
-# Requisitos:
-# - st.secrets["gcp_service_account"] (JSON da Service Account)
-# - Permissões de edição na planilha
-# - TELEGRAM_TOKEN e CHAT_IDs abaixo (pode mover para st.secrets se preferir)
+# Atualização: conexão robusta com secrets (aceita várias chaves) + fallback
 
 import streamlit as st
 import pandas as pd
@@ -12,31 +9,26 @@ from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from gspread.utils import rowcol_to_a1
 from datetime import datetime, date, time as dt_time
-import pytz
-import unicodedata
-import requests
-import random
-import string
+import pytz, unicodedata, requests, random, string, json, os
 
 # =========================
-# CONFIG (ajuste conforme seu app)
+# CONFIG
 # =========================
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 
-ABA_DADOS_FEM = "Base de Dados Feminino"      # sua base feminina
-ABA_STATUS_FEM = "clientes_status_feminino"   # opcional, se existir
-ABA_AGENDAMENTO = "Agendamento"               # nova/atual aba de agenda
+ABA_DADOS_FEM = "Base de Dados Feminino"
+ABA_STATUS_FEM = "clientes_status_feminino"   # opcional
+ABA_AGENDAMENTO = "Agendamento"
 
 TZ = "America/Sao_Paulo"
 DATA_FMT = "%d/%m/%Y"
 HORA_FMT = "%H:%M:%S"
 
-# Telegram (use estes IDs já usados no projeto)
-TELEGRAM_TOKEN = "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE"
-CHAT_ID_JPAULO = "493747253"
-CHAT_ID_FEMININO = "-1002965378062"  # Canal Salão JP Feminino
+# --- Telegram via secrets (fallback para hardcode) ---
+TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE")
+CHAT_ID_JPAULO = st.secrets.get("TELEGRAM_CHAT_ID_JPAULO", "493747253")
+CHAT_ID_FEMININO = st.secrets.get("TELEGRAM_CHAT_ID_FEMININO", "-1002965378062")
 
-# Funcionário padrão (feminino)
 FUNCIONARIOS_FEM = ["Meire", "Daniela"]
 FUNCIONARIO_PADRAO = "Meire"
 
@@ -72,14 +64,32 @@ def send_telegram(text: str):
         st.warning(f"Falha ao notificar no Telegram: {e}")
 
 # =========================
-# Conexão Sheets
+# Conexão Sheets (robusta a diferentes secrets)
 # =========================
 @st.cache_resource(show_spinner=False)
 def conectar_sheets():
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=[
+    # tenta várias chaves nos secrets / env
+    cand = (
+        st.secrets.get("gcp_service_account") or
+        st.secrets.get("gcp_service_account_feminino") or
+        st.secrets.get("google_credentials") or
+        st.secrets.get("GCP_SERVICE_ACCOUNT") or
+        os.environ.get("GCP_SERVICE_ACCOUNT")
+    )
+    if cand is None:
+        raise KeyError(
+            "Credenciais não encontradas. Adicione em secrets uma das chaves: "
+            "gcp_service_account / gcp_service_account_feminino / google_credentials / GCP_SERVICE_ACCOUNT"
+        )
+    if isinstance(cand, str):
+        # pode vir como string JSON
+        cand = json.loads(cand)
+
+    scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
-    ])
+    ]
+    creds = Credentials.from_service_account_info(cand, scopes=scopes)
     return gspread.authorize(creds)
 
 gc = conectar_sheets()
@@ -103,7 +113,6 @@ def garantir_estrutura_agenda():
     ws = abrir_ws(ABA_AGENDAMENTO)
     df = get_as_dataframe(ws, evaluate_formulas=False, header=0)
     if df.empty or list(df.columns) != COLS_AGENDA:
-        # reescreve cabeçalho (preserva dados se existirem e colunas baterem)
         ws.clear()
         ws.update(rowcol_to_a1(1, 1), [COLS_AGENDA])
 
@@ -113,7 +122,6 @@ def carregar_df(aba: str) -> pd.DataFrame:
     ws = abrir_ws(aba)
     df = get_as_dataframe(ws, evaluate_formulas=False, header=0)
     df = df.dropna(how="all")
-    # Ajusta colunas vazias
     if aba == ABA_AGENDAMENTO and not df.empty:
         faltantes = [c for c in COLS_AGENDA if c not in df.columns]
         for c in faltantes: df[c] = ""
@@ -131,7 +139,6 @@ def salvar_df(aba: str, df: pd.DataFrame):
 
 def clientes_existentes() -> list:
     nomes = set()
-    # Base feminina
     try:
         df = carregar_df(ABA_DADOS_FEM)
         if "Cliente" in df.columns:
@@ -139,7 +146,6 @@ def clientes_existentes() -> list:
                 nomes.add(x.strip())
     except Exception:
         pass
-    # clientes_status_feminino (se existir)
     try:
         df2 = carregar_df(ABA_STATUS_FEM)
         for col in df2.columns:
@@ -165,14 +171,11 @@ acao = st.radio(
 # ---------- 1) AGENDAR ----------
 if acao.startswith("➕"):
     st.subheader("Novo agendamento")
-
-    # Data & hora
     colA, colB, colC = st.columns([1,1,2])
     data_ag = colA.date_input("Data", value=date.today())
     hora_ag = colB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
     funcionario = colC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
-    # Cliente (autocomplete com existentes + campo para novo)
     clientes = clientes_existentes()
     cli_opcoes = ["(digite novo cliente)"] + clientes
     cliente_sel = st.selectbox("Cliente", cli_opcoes, index=1 if clientes else 0)
@@ -187,8 +190,7 @@ if acao.startswith("➕"):
     col3, col4 = st.columns([1,1])
     conta = col3.text_input("Conta / Forma de pagamento", value="Carteira")
     combo = col4.text_input("Combo (opcional)", placeholder="Ex.: corte+barba")
-
-    obs = st.text_area("Observação (opcional)", placeholder="Preferências, referências, etc.")
+    obs = st.text_area("Observação (opcional)")
 
     if st.button("Agendar e notificar", type="primary", use_container_width=True):
         if not cliente_final:
@@ -219,7 +221,6 @@ if acao.startswith("➕"):
             df_ag = pd.concat([df_ag, pd.DataFrame([linha])], ignore_index=True)
             salvar_df(ABA_AGENDAMENTO, df_ag)
 
-            # Telegram
             msg = (
                 "📅 <b>Novo agendamento</b>\n"
                 f"👤 <b>Cliente:</b> {cliente_final}\n"
@@ -242,11 +243,9 @@ elif acao.startswith("✅"):
     if df_ag.empty or not (df_ag["Status"] == "Agendado").any():
         st.info("Nenhum agendamento em aberto.")
     else:
-        # Apenas abertos
         em_aberto = df_ag[df_ag["Status"] == "Agendado"].copy()
-        # Campos editáveis para confirmação
         em_aberto["Selecionar"] = False
-        # Conversão segura de valor
+
         def fix_val(v):
             s = str(v).strip().replace(",", ".")
             try:
@@ -284,7 +283,6 @@ elif acao.startswith("✅"):
             if selecionar.empty:
                 st.warning("Selecione pelo menos um agendamento.")
             else:
-                # Carrega base feminina para append
                 df_base = carregar_df(ABA_DADOS_FEM)
                 cols_base = list(df_base.columns) if not df_base.empty else [
                     "Data","Serviço","Valor","Conta","Cliente","Combo","Funcionário",
@@ -294,11 +292,9 @@ elif acao.startswith("✅"):
                 if df_base.empty:
                     df_base = pd.DataFrame(columns=cols_base)
 
-                registros_novos = []
-                ids_atendidos = []
+                registros_novos, ids_atendidos = [], []
 
                 for _, row in selecionar.iterrows():
-                    # Monta lançamento na Base
                     data_txt = str(row["Data"])
                     hora_txt = str(row["Hora"])
                     try:
@@ -308,7 +304,6 @@ elif acao.startswith("✅"):
                     periodo = periodo_por_hora(hh)
 
                     servico = str(row["Serviço"]).strip()
-                    # Serviço com primeira letra maiúscula (sem mudar combo minúsculo)
                     if servico:
                         servico = servico[:1].upper() + servico[1:]
 
@@ -329,7 +324,6 @@ elif acao.startswith("✅"):
                         "Fase": "Dono + funcionário",
                         "Tipo": "Serviço",
                         "Período": periodo,
-                        # campos de fiado vazios/compatíveis
                         "StatusFiado": "",
                         "IDLancFiado": "",
                         "VencimentoFiado": "",
@@ -339,31 +333,25 @@ elif acao.startswith("✅"):
                         "Quitado_em": "",
                         "Observação": str(row["Observação"]).strip(),
                     }
-                    # Garante todas as colunas da base
                     for c in cols_base:
                         if c not in novo:
                             novo[c] = ""
-
                     registros_novos.append(novo)
                     ids_atendidos.append(row["IDAgenda"])
 
-                # Append na Base
                 df_base = pd.concat([df_base, pd.DataFrame(registros_novos)], ignore_index=True)
                 salvar_df(ABA_DADOS_FEM, df_base)
 
-                # Atualiza status na Agenda
                 df_ag = carregar_df(ABA_AGENDAMENTO)
                 agora_txt = tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
                 df_ag.loc[df_ag["IDAgenda"].isin(ids_atendidos), "Status"] = "Atendido"
                 df_ag.loc[df_ag["IDAgenda"].isin(ids_atendidos), "Atendido_em"] = agora_txt
                 salvar_df(ABA_AGENDAMENTO, df_ag)
 
-                # Telegram (resumo)
-                qtd = len(ids_atendidos)
-                msg = f"✅ <b>Atendimentos confirmados</b>\n🗂️ {qtd} registro(s) lançado(s) na Base de Dados Feminino."
+                msg = f"✅ <b>Atendimentos confirmados</b>\n🗂️ {len(ids_atendidos)} registro(s) lançado(s) na Base de Dados Feminino."
                 send_telegram(msg)
 
-                st.success(f"{qtd} atendimento(s) confirmados e lançados na base.")
+                st.success(f"{len(ids_atendidos)} atendimento(s) confirmados e lançados na base.")
 
 # ---------- 3) EM ABERTO ----------
 else:
@@ -376,7 +364,6 @@ else:
         if abertos.empty:
             st.success("Sem agendamentos em aberto 🎉")
         else:
-            # Ordena por data/hora
             def dt_key(r):
                 try:
                     d = datetime.strptime(str(r["Data"]), DATA_FMT)
@@ -392,7 +379,5 @@ else:
                 use_container_width=True,
                 hide_index=True,
             )
-
-            # Export
             csv = abertos.to_csv(index=False).encode("utf-8-sig")
             st.download_button("Baixar CSV", data=csv, file_name="agendamentos_em_aberto.csv", mime="text/csv")
