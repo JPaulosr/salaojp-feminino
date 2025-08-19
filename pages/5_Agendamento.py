@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-# 14_Agendamento.py — Agenda com notificações no Telegram (com FOTO) + confirmação em lote
-# Atualizações:
-# - Serviço e Combo passam a ser sugeridos a partir da Base de Dados Feminino
-# - Notificação no Telegram envia a FOTO do cliente (se existir); fallback para logo
+# 14_Agendamento.py — Agenda com notificações (FOTO) + confirmação em lote com CARD no Telegram
 
 import streamlit as st
 import pandas as pd
@@ -26,13 +23,10 @@ TZ = "America/Sao_Paulo"
 DATA_FMT = "%d/%m/%Y"
 HORA_FMT = "%H:%M:%S"
 
-# Foto padrão (logo) quando cliente não tem imagem cadastrada
 PHOTO_FALLBACK_URL = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
-
-# Colunas candidatas de foto na planilha de status
 FOTO_COL_CANDIDATES = ["link_foto", "foto", "imagem", "url_foto", "foto_link", "link", "image", "foto_url"]
 
-# --- Telegram via secrets (fallback para hardcode) ---
+# Telegram via secrets (fallback para hardcode)
 TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE")
 CHAT_ID_JPAULO = st.secrets.get("TELEGRAM_CHAT_ID_JPAULO", "493747253")
 CHAT_ID_FEMININO = st.secrets.get("TELEGRAM_CHAT_ID_FEMININO", "-1002965378062")
@@ -72,17 +66,30 @@ def send_telegram_message(text: str):
         st.warning(f"Falha ao enviar mensagem no Telegram: {e}")
 
 def send_telegram_photo(photo_url: str, caption: str):
-    """Envia foto com legenda; se falhar, manda mensagem simples."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
         for chat_id in (CHAT_ID_FEMININO, CHAT_ID_JPAULO):
             payload = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
             r = requests.post(url, data=payload, timeout=10)
-            # Alguns servidores bloqueiam o HEAD/GET da imagem; se 400, cai pro texto:
             if r.status_code != 200:
                 send_telegram_message(caption)
     except Exception:
         send_telegram_message(caption)
+
+def card_confirmacao(cliente, servico, valor, conta, funcionario, data_txt, hora_txt, obs, ida):
+    val = "-" if (valor is None or str(valor).strip() == "" or str(valor) == "nan") else f"R$ {float(valor):.2f}".replace(".", ",")
+    obs_txt = obs or "-"
+    return (
+        "✅ <b>Atendimento confirmado</b>\n"
+        f"👤 <b>Cliente:</b> {cliente}\n"
+        f"🧴 <b>Serviço:</b> {servico}\n"
+        f"💳 <b>Conta:</b> {conta}\n"
+        f"💲 <b>Valor:</b> {val}\n"
+        f"🧑‍💼 <b>Funcionário:</b> {funcionario}\n"
+        f"🗓️ <b>Data/Hora:</b> {data_txt} {hora_txt}\n"
+        f"📝 <b>Obs.:</b> {obs_txt}\n"
+        f"🏷️ <b>ID:</b> {ida}"
+    )
 
 # =========================
 # Conexão Sheets (robusta)
@@ -182,7 +189,6 @@ def clientes_existentes() -> list:
 
 @st.cache_data(show_spinner=False)
 def servicos_e_combos():
-    """Retorna (servicos:list, combos:list) únicos não vazios a partir da Base Feminino."""
     servs, combs = [], []
     try:
         df = carregar_df(ABA_DADOS_FEM)
@@ -193,8 +199,6 @@ def servicos_e_combos():
                 combs = [c for c in df["Combo"].dropna().astype(str) if c.strip()]
     except Exception:
         pass
-    # normaliza e ordena
-    # Serviço: primeira letra maiúscula; Combo: minúsculo como na base
     servs_norm = []
     for s in servs:
         s = s.strip()
@@ -205,14 +209,12 @@ def servicos_e_combos():
     return uniq_servs, uniq_combos
 
 def foto_do_cliente(cliente: str) -> str:
-    """Busca URL da foto no clientes_status_feminino (colunas candidatas); fallback para logo."""
     if not cliente:
         return PHOTO_FALLBACK_URL
     try:
         df = carregar_df(ABA_STATUS_FEM)
         if df.empty:
             return PHOTO_FALLBACK_URL
-        # achar coluna do nome
         nome_col = None
         for col in df.columns:
             if norm(col) in ("cliente","nome","nome_cliente"):
@@ -220,7 +222,6 @@ def foto_do_cliente(cliente: str) -> str:
                 break
         if not nome_col:
             return PHOTO_FALLBACK_URL
-        # filtra pelo nome (case/acentos-insensível)
         df["_k"] = df[nome_col].astype(str).apply(norm)
         alvo = norm(cliente)
         linha = df[df["_k"] == alvo].head(1)
@@ -255,7 +256,7 @@ if acao.startswith("➕"):
     hora_ag = colB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
     funcionario = colC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
-    # Cliente (autocomplete com existentes + campo para novo)
+    # Cliente
     clientes = clientes_existentes()
     cli_opcoes = ["(digite novo cliente)"] + clientes
     cliente_sel = st.selectbox("Cliente", cli_opcoes, index=1 if clientes else 0)
@@ -264,9 +265,8 @@ if acao.startswith("➕"):
         cliente_txt = st.text_input("Novo cliente")
     cliente_final = (cliente_txt or cliente_sel).strip()
 
-    # Serviços/Combos vindos da base (com opção Outro)
+    # Serviços/Combos da base
     servs, combs = servicos_e_combos()
-
     col1, col2 = st.columns([2,1])
     serv_opcoes = ["(Outro)"] + servs if servs else ["(Outro)"]
     serv_sel = col1.selectbox("Serviço", serv_opcoes)
@@ -275,20 +275,17 @@ if acao.startswith("➕"):
         serv_txt = col1.text_input("Digite o serviço")
     servico = (serv_txt or serv_sel).strip()
     if servico:
-        servico = servico[:1].upper() + servico[1:]  # inicial maiúscula
-
+        servico = servico[:1].upper() + servico[1:]
     valor = col2.text_input("Valor (R$)", placeholder="Ex.: 35,00")
 
     col3, col4 = st.columns([1,1])
     conta = col3.text_input("Conta / Forma de pagamento", value="Carteira")
-
     combo_opcoes = ["(Sem combo)"] + combs if combs else ["(Sem combo)"]
     combo_sel = col4.selectbox("Combo", combo_opcoes, index=0)
     combo_txt = ""
     if combo_sel == "(Sem combo)":
         combo_txt = col4.text_input("Digite o combo (opcional)", placeholder="Ex.: corte+barba")
     combo = (combo_txt or ("" if combo_sel == "(Sem combo)" else combo_sel)).strip()
-
     obs = st.text_area("Observação (opcional)", placeholder="Preferências, referências, etc.")
 
     if st.button("Agendar e notificar", type="primary", use_container_width=True):
@@ -395,6 +392,7 @@ elif acao.startswith("✅"):
 
                 registros_novos, ids_atendidos = [], []
 
+                # Construo uma cópia “selecionar” para iterar mantendo os valores editados
                 for _, row in selecionar.iterrows():
                     data_txt = str(row["Data"])
                     hora_txt = str(row["Hora"])
@@ -437,23 +435,43 @@ elif acao.startswith("✅"):
                     for c in cols_base:
                         if c not in novo:
                             novo[c] = ""
+
                     registros_novos.append(novo)
                     ids_atendidos.append(row["IDAgenda"])
 
+                # 1) Append na Base
                 df_base = pd.concat([df_base, pd.DataFrame(registros_novos)], ignore_index=True)
                 salvar_df(ABA_DADOS_FEM, df_base)
 
+                # 2) Atualiza status na Agenda
                 df_ag = carregar_df(ABA_AGENDAMENTO)
                 agora_txt = tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
                 df_ag.loc[df_ag["IDAgenda"].isin(ids_atendidos), "Status"] = "Atendido"
                 df_ag.loc[df_ag["IDAgenda"].isin(ids_atendidos), "Atendido_em"] = agora_txt
                 salvar_df(ABA_AGENDAMENTO, df_ag)
 
-                # Telegram (resumo simples)
+                # 3) Envia CARD com FOTO para CADA atendimento confirmado
+                for _, row in selecionar.iterrows():
+                    foto_url = foto_do_cliente(str(row["Cliente"]).strip())
+                    caption = card_confirmacao(
+                        cliente=str(row["Cliente"]).strip(),
+                        servico=(str(row["Serviço"]).strip()[:1].upper() + str(row["Serviço"]).strip()[1:] if str(row["Serviço"]).strip() else ""),
+                        valor=row["Valor"],
+                        conta=str(row["Conta"]).strip() or "Carteira",
+                        funcionario=str(row["Funcionário"]).strip() or FUNCIONARIO_PADRAO,
+                        data_txt=str(row["Data"]),
+                        hora_txt=str(row["Hora"]),
+                        obs=str(row["Observação"]).strip(),
+                        ida=str(row["IDAgenda"]),
+                    )
+                    send_telegram_photo(foto_url, caption)
+
+                # 4) Mensagem-resumo
                 send_telegram_message(
-                    f"✅ <b>Atendimentos confirmados</b>\n🗂️ {len(ids_atendidos)} registro(s) lançado(s) na Base de Dados Feminino."
+                    f"🧾 <b>Resumo</b>: {len(ids_atendidos)} atendimento(s) confirmado(s) e lançados na Base de Dados Feminino."
                 )
-                st.success(f"{len(ids_atendidos)} atendimento(s) confirmados e lançados na base.")
+
+                st.success(f"{len(ids_atendidos)} atendimento(s) confirmados, cards enviados e base atualizada.")
 
 # ---------- 3) EM ABERTO ----------
 else:
