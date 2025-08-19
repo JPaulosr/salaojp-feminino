@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 14_Agendamento.py — Agenda com FOTO + Combo com linhas editáveis + CARD na confirmação
+# 14_Agendamento.py — Agenda Feminino com foto, combos editáveis e cards no Telegram
 
 import streamlit as st
 import pandas as pd
@@ -14,7 +14,7 @@ from datetime import datetime, date, time as dt_time
 # =========================
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 ABA_DADOS_FEM = "Base de Dados Feminino"
-ABA_STATUS_FEM = "clientes_status_feminino"     # se não existir, ignora
+ABA_STATUS_FEM = "clientes_status_feminino"   # se não existir, o código ignora
 ABA_AGENDAMENTO = "Agendamento"
 
 TZ = "America/Sao_Paulo"
@@ -23,6 +23,7 @@ DATA_FMT = "%d/%m/%Y"; HORA_FMT = "%H:%M:%S"
 PHOTO_FALLBACK_URL = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
 FOTO_COL_CANDIDATES = ["link_foto","foto","imagem","url_foto","foto_link","link","image","foto_url"]
 
+# Telegram (pode mover para secrets; há fallback)
 TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE")
 CHAT_ID_JPAULO = st.secrets.get("TELEGRAM_CHAT_ID_JPAULO", "493747253")
 CHAT_ID_FEMININO = st.secrets.get("TELEGRAM_CHAT_ID_FEMININO", "-1002965378062")
@@ -34,11 +35,14 @@ FUNCIONARIO_PADRAO = "Meire"
 # Utils
 # =========================
 def tz_now(): return datetime.now(pytz.timezone(TZ))
-def norm(s): 
+
+def norm(s):
     if not isinstance(s,str): return ""
-    s="".join(ch for ch in unicodedata.normalize("NFKD", s.strip().lower()) if not unicodedata.combining(ch))
+    s = "".join(ch for ch in unicodedata.normalize("NFKD", s.strip().lower()) if not unicodedata.combining(ch))
     return s
+
 def periodo_por_hora(hh): return "Manhã" if 5<=hh<12 else ("Tarde" if 12<=hh<18 else "Noite")
+
 def novo_id(prefix="AG"):
     return f"{prefix}-{tz_now().strftime('%Y%m%d%H%M%S')}-{''.join(random.choices(string.ascii_uppercase+string.digits,k=4))}"
 
@@ -59,6 +63,18 @@ def send_tg_photo(photo_url, caption):
     except Exception:
         send_tg_msg(caption)
 
+def card_confirmacao(c, s, v, conta, f, d, h, obs, ida):
+    val="-" if v in ("",None) else f"R$ {float(v):.2f}".replace(".",",")
+    return ("✅ <b>Atendimento confirmado</b>\n"
+            f"👤 <b>Cliente:</b> {c}\n"
+            f"🧴 <b>Serviço:</b> {s}\n"
+            f"💳 <b>Conta:</b> {conta}\n"
+            f"💲 <b>Valor:</b> {val}\n"
+            f"🧑‍💼 <b>Funcionário:</b> {f}\n"
+            f"🗓️ <b>Data/Hora:</b> {d} {h}\n"
+            f"📝 <b>Obs.:</b> {obs or '-'}\n"
+            f"🏷️ <b>ID:</b> {ida}")
+
 # =========================
 # Google Sheets (robusto)
 # =========================
@@ -67,7 +83,8 @@ def conectar_sheets():
     cand = (st.secrets.get("gcp_service_account") or st.secrets.get("gcp_service_account_feminino")
             or st.secrets.get("google_credentials") or st.secrets.get("GCP_SERVICE_ACCOUNT")
             or os.environ.get("GCP_SERVICE_ACCOUNT"))
-    if cand is None: raise KeyError("Credenciais ausentes nos secrets.")
+    if cand is None:
+        raise KeyError("Credenciais ausentes. Adicione em secrets uma das chaves: gcp_service_account / gcp_service_account_feminino / google_credentials / GCP_SERVICE_ACCOUNT")
     if isinstance(cand,str): cand=json.loads(cand)
     creds = Credentials.from_service_account_info(cand, scopes=[
         "https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"
@@ -78,11 +95,11 @@ gc = conectar_sheets(); sh = gc.open_by_key(SHEET_ID)
 
 def abrir_ws(nome):
     try: return sh.worksheet(nome)
-    except gspread.WorksheetNotFound: return sh.add_worksheet(title=nome, rows=2000, cols=40)
+    except gspread.WorksheetNotFound: return sh.add_worksheet(title=nome, rows=3000, cols=60)
 
 COLS_AGENDA = [
     "IDAgenda","Data","Hora","Cliente","Serviço","Valor","Conta","Funcionário",
-    "Combo","Observação","Status","Criado_em","Atendido_em","ItensComboJSON"   # ← NOVO
+    "Combo","Observação","Status","Criado_em","Atendido_em","ItensComboJSON"
 ]
 
 def garantir_estrutura_agenda():
@@ -103,9 +120,13 @@ def carregar_df(aba):
 
 def salvar_df(aba, df):
     ws=abrir_ws(aba)
+    if df.empty:
+        ws.clear(); ws.update(rowcol_to_a1(1,1), [list(df.columns)]); return
     ws.clear(); set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
-# ---- dados auxiliares
+# -------------------------
+# Dados auxiliares (Clientes, Serviços, Combos, Foto)
+# -------------------------
 @st.cache_data(show_spinner=False)
 def clientes_existentes():
     nomes=set()
@@ -137,7 +158,6 @@ def servicos_e_combos():
     return sorted(set(servs), key=lambda s:norm(s)), sorted(set(combs), key=lambda s:norm(s))
 
 def preco_sugerido(servico):
-    """Sugerir preço pelo valor mediano do histórico daquele serviço."""
     try:
         df=carregar_df(ABA_DADOS_FEM)
         if "Serviço" in df.columns and "Valor" in df.columns:
@@ -167,90 +187,83 @@ def foto_do_cliente(cliente):
     except: pass
     return PHOTO_FALLBACK_URL
 
-def card_confirmacao(c, s, v, conta, f, d, h, obs, ida):
-    val="-" if v in ("",None) else f"R$ {float(v):.2f}".replace(".",",")
-    return ("✅ <b>Atendimento confirmado</b>\n"
-            f"👤 <b>Cliente:</b> {c}\n"
-            f"🧴 <b>Serviço:</b> {s}\n"
-            f"💳 <b>Conta:</b> {conta}\n"
-            f"💲 <b>Valor:</b> {val}\n"
-            f"🧑‍💼 <b>Funcionário:</b> {f}\n"
-            f"🗓️ <b>Data/Hora:</b> {d} {h}\n"
-            f"📝 <b>Obs.:</b> {obs or '-'}\n"
-            f"🏷️ <b>ID:</b> {ida}")
+# --------- helpers para listas grandes (filtro simples) ----------
+def filter_options(options, query, limit=200):
+    if not query: 
+        return options[:limit]
+    q=norm(query)
+    return [o for o in options if q in norm(o)][:limit]
 
 # =========================
 # UI
 # =========================
 st.title("📅 Agendamento (Feminino)")
-acao = st.radio("Ações:", ["➕ Agendar","✅ Confirmar atendimentos","🗂️ Em aberto & exportação"])
+acao = st.radio("Ações:", ["➕ Agendar","✅ Confirmar atendimentos","🗂️ Em aberto & exportação"], horizontal=False)
 
 # ---------- 1) AGENDAR ----------
 if acao.startswith("➕"):
     st.subheader("Novo agendamento")
+    cA,cB,cC=st.columns([1,1,2])
+    data_ag=cA.date_input("Data", value=date.today())
+    hora_ag=cB.time_input("Hora", value=dt_time(9,0,0), step=300)
+    funcionario=cC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
-    # Data / Hora / Funcionário
-    cA, cB, cC = st.columns([1, 1, 2])
-    data_ag = cA.date_input("Data", value=date.today())
-    hora_ag = cB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
-    funcionario = cC.selectbox(
-        "Funcionário",
-        options=FUNCIONARIOS_FEM,
-        index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO)
-    )
+    # Cliente (com filtro para não mostrar milhares de opções)
+    clientes=clientes_existentes()
+    fcli=st.text_input("🔎 Filtrar clientes", placeholder="Digite parte do nome…")
+    clientes_filtrados=filter_options(clientes, fcli, limit=200)
+    op_cli=["(digite novo cliente)"]+clientes_filtrados
+    cli_sel=st.selectbox("Cliente", op_cli, index=1 if clientes_filtrados else 0)
+    cli_txt=st.text_input("Novo cliente") if cli_sel=="(digite novo cliente)" else ""
+    cliente_final=(cli_txt or cli_sel).strip()
 
-    # Cliente (selectbox + “novo”)
-    clientes = clientes_existentes()
-    op_cli = ["(digite novo cliente)"] + clientes
-    cli_sel = st.selectbox("Cliente", op_cli, index=1 if clientes else 0)
-    cli_txt = st.text_input("Novo cliente") if cli_sel == "(digite novo cliente)" else ""
-    cliente_final = (cli_txt or cli_sel).strip()
-
-    # Serviço / Valor
+    # Serviço (com filtro)
     servs, combs = servicos_e_combos()
-    c1, c2 = st.columns([2, 1])
-    serv_sel = c1.selectbox("Serviço", ["(Outro)"] + servs)
-    serv_txt = c1.text_input("Digite o serviço") if serv_sel == "(Outro)" else ""
-    servico = (serv_txt or serv_sel).strip()
-    if servico:
-        servico = servico[:1].upper() + servico[1:]
-    valor = c2.text_input("Valor (R$)", placeholder="Ex.: 35,00")
+    fserv=st.text_input("🔎 Filtrar serviços", placeholder="Ex.: escova, unha…")
+    servs_filtrados = filter_options(servs, fserv, limit=200)
 
-    # Conta / Combo
-    c3, c4 = st.columns([1, 1])
-    conta = c3.text_input("Conta / Forma de pagamento", value="Carteira")
-    combo_sel = c4.selectbox("Combo", ["(Sem combo)"] + combs, index=0)
-    combo_txt = c4.text_input("Digite o combo (opcional)", placeholder="Ex.: corte+barba") if combo_sel == "(Sem combo)" else ""
-    combo = (combo_txt or ("" if combo_sel == "(Sem combo)" else combo_sel)).strip()
+    c1,c2=st.columns([2,1])
+    serv_sel=c1.selectbox("Serviço", ["(Outro)"]+servs_filtrados)
+    serv_txt=c1.text_input("Digite o serviço") if serv_sel=="(Outro)" else ""
+    servico=(serv_txt or serv_sel).strip()
+    if servico: servico=servico[:1].upper()+servico[1:]
+    valor=c2.text_input("Valor (R$)", placeholder="Ex.: 35,00")
 
-    obs = st.text_area("Observação (opcional)", placeholder="Preferências, referências, etc.")
+    # Conta / Combo (com filtro)
+    c3,c4=st.columns([1,1])
+    conta=c3.text_input("Conta / Forma de pagamento", value="Carteira")
 
-    # ——— Itens do combo: aparece só quando combo foi informado ———
-    itens_combo = []
+    fcombo=st.text_input("🔎 Filtrar combos", placeholder="Ex.: unha+mão…")
+    combs_filtrados = filter_options(combs, fcombo, limit=200)
+    combo_sel=c4.selectbox("Combo", ["(Sem combo)"]+combs_filtrados, index=0)
+    combo_txt=c4.text_input("Digite o combo (opcional)", placeholder="Ex.: corte+barba") if combo_sel=="(Sem combo)" else ""
+    combo=(combo_txt or ("" if combo_sel=="(Sem combo)" else combo_sel)).strip()
+
+    obs=st.text_area("Observação (opcional)", placeholder="Preferências, referências, etc.")
+
+    # Itens do combo (mini‑tabela)
+    itens_combo=[]
     if combo:
-        # divide pelo “+” → cria uma mini-tabela somente com os serviços do combo
-        raw = [x.strip() for x in combo.split("+") if x.strip()]
-        rows = []
+        raw=[x.strip() for x in combo.split("+") if x.strip()]
+        rows=[]
         for s in raw:
-            nome = s[:1].upper() + s[1:]
-            sug = preco_sugerido(nome)  # mediana do histórico (se existir)
+            nome=s[:1].upper()+s[1:]
+            sug=preco_sugerido(nome)
             rows.append({"Serviço": nome, "Valor (R$)": sug})
-        df_edit = pd.DataFrame(rows)
-
+        df_edit=pd.DataFrame(rows)
         st.markdown("**Itens do combo (edite os valores antes de agendar):**")
-        df_edit = st.data_editor(
+        df_edit=st.data_editor(
             df_edit,
             column_config={"Valor (R$)": st.column_config.NumberColumn("Valor (R$)", step=0.5, format="%.2f")},
             disabled=["Serviço"],
             key="editor_itens_combo",
             use_container_width=True,
-            height=140 + 28 * len(rows)
+            height=min(420, 120 + 30*len(rows))
         )
-        for _, r in df_edit.iterrows():
-            v = None if pd.isna(r["Valor (R$)"]) else float(r["Valor (R$)"])
+        for _,r in df_edit.iterrows():
+            v=None if pd.isna(r["Valor (R$)"]) else float(r["Valor (R$)"])
             itens_combo.append({"servico": r["Serviço"], "valor": v})
 
-    # ——— Salvar + Telegram ———
     if st.button("Agendar e notificar", type="primary", use_container_width=True):
         if not cliente_final:
             st.error("Informe o cliente.")
@@ -258,65 +271,45 @@ if acao.startswith("➕"):
             st.error("Informe o serviço ou um combo.")
         else:
             garantir_estrutura_agenda()
-            df_ag = carregar_df(ABA_AGENDAMENTO)
+            df_ag=carregar_df(ABA_AGENDAMENTO)
 
-            # total do combo = soma dos itens; senão usa o campo "Valor"
-            valor_total = None
+            # total = soma itens do combo (quando houver) ou valor do campo
+            valor_total=None
             if combo and itens_combo:
-                soma = [i["valor"] for i in itens_combo if i["valor"] not in (None, "")]
-                if soma:
-                    valor_total = round(float(sum(soma)), 2)
+                soma=[i["valor"] for i in itens_combo if i["valor"] not in (None,"")]
+                if soma: valor_total=round(float(sum(soma)),2)
             if valor_total is None:
-                try:
-                    valor_total = round(float(str(valor).replace(",", ".")), 2)
-                except:
-                    valor_total = ""
+                try: valor_total=round(float(str(valor).replace(",",".")),2)
+                except: valor_total=""
 
-            ida = novo_id("AG")
-            criado_em = tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
-            linha = {
-                "IDAgenda": ida,
-                "Data": data_ag.strftime(DATA_FMT),
-                "Hora": hora_ag.strftime(HORA_FMT),
-                "Cliente": cliente_final,
-                "Serviço": servico,  # pode ficar vazio se for somente combo
-                "Valor": valor_total,
-                "Conta": conta,
-                "Funcionário": funcionario,
-                "Combo": combo,
-                "Observação": obs,
-                "Status": "Agendado",
-                "Criado_em": criado_em,
-                "Atendido_em": "",
+            ida=novo_id("AG"); criado_em=tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
+            linha={
+                "IDAgenda": ida, "Data": data_ag.strftime(DATA_FMT), "Hora": hora_ag.strftime(HORA_FMT),
+                "Cliente": cliente_final, "Serviço": servico, "Valor": valor_total, "Conta": conta,
+                "Funcionário": funcionario, "Combo": combo, "Observação": obs,
+                "Status": "Agendado", "Criado_em": criado_em, "Atendido_em": "",
                 "ItensComboJSON": json.dumps(itens_combo, ensure_ascii=False) if itens_combo else ""
             }
-            df_ag = pd.concat([df_ag, pd.DataFrame([linha])], ignore_index=True)
+            df_ag=pd.concat([df_ag, pd.DataFrame([linha])], ignore_index=True)
             salvar_df(ABA_AGENDAMENTO, df_ag)
 
-            # Telegram (foto + detalhamento do combo quando houver)
-            foto_url = foto_do_cliente(cliente_final)
-            det = ""
+            # Telegram com foto + detalhamento
+            foto=foto_do_cliente(cliente_final)
+            det=""
             if itens_combo:
-                linhas = [
-                    f"   • {it['servico']}: R$ {0 if (it['valor'] in (None,'')) else it['valor']:.2f}".replace(".", ",")
-                    for it in itens_combo
-                ]
-                det = "\n🧾 <b>Itens:</b>\n" + "\n".join(linhas)
-
-            caption = (
-                "📅 <b>Novo agendamento</b>\n"
-                f"👤 <b>Cliente:</b> {cliente_final}\n"
-                f"🧴 <b>Serviço:</b> {servico or '-'}\n"
-                f"💳 <b>Conta:</b> {conta}\n"
-                f"💲 <b>Total:</b> "
-                f"{('-' if valor_total in ('', None) else ('R$ ' + str(f'{valor_total:.2f}'.replace('.',','))))}\n"
-                f"🧑‍💼 <b>Funcionário:</b> {funcionario}\n"
-                f"🗓️ <b>Data/Hora:</b> {linha['Data']} {linha['Hora']}\n"
-                f"📝 <b>Obs.:</b> {obs or '-'}\n"
-                f"🏷️ <b>ID:</b> {ida}"
-                f"{det}"
-            )
-            send_tg_photo(foto_url, caption)
+                linhas=[f"   • {it['servico']}: R$ {0 if (it['valor'] in (None,'')) else it['valor']:.2f}".replace(".",",")
+                        for it in itens_combo]
+                det="\n🧾 <b>Itens:</b>\n" + "\n".join(linhas)
+            caption=("📅 <b>Novo agendamento</b>\n"
+                     f"👤 <b>Cliente:</b> {cliente_final}\n"
+                     f"🧴 <b>Serviço:</b> {servico or '-'}\n"
+                     f"💳 <b>Conta:</b> {conta}\n"
+                     f"💲 <b>Total:</b> {('-' if valor_total in ('',None) else ('R$ '+str(f'{valor_total:.2f}'.replace('.',',')) ))}\n"
+                     f"🧑‍💼 <b>Funcionário:</b> {funcionario}\n"
+                     f"🗓️ <b>Data/Hora:</b> {linha['Data']} {linha['Hora']}\n"
+                     f"📝 <b>Obs.:</b> {obs or '-'}\n"
+                     f"🏷️ <b>ID:</b> {ida}{det}")
+            send_tg_photo(foto, caption)
             st.success("Agendado e notificado com sucesso ✅")
 
 # ---------- 2) CONFIRMAR ----------
@@ -394,7 +387,6 @@ elif acao.startswith("✅"):
                                 if c not in novo: novo[c]=""
                             novos.append(novo)
                     else:
-                        # fluxo simples (1 linha)
                         s=str(row["Serviço"]).strip()
                         if s: s=s[:1].upper()+s[1:]
                         try: v=float(str(row["Valor"]).replace(",",".")); 
@@ -424,7 +416,7 @@ elif acao.startswith("✅"):
                 df_ag.loc[df_ag["IDAgenda"].isin(ids), "Atendido_em"]=agora
                 salvar_df(ABA_AGENDAMENTO, df_ag)
 
-                # notificar: card por confirmação (usa serviço simples; para combos envia 1 card total)
+                # notificar: card por confirmação
                 for _,row in selecionar.iterrows():
                     foto=foto_do_cliente(str(row["Cliente"]).strip())
                     caption=card_confirmacao(
@@ -457,7 +449,9 @@ else:
                 except: return datetime.max
             abertos["__ord"]=abertos.apply(dt_key, axis=1)
             abertos=abertos.sort_values("__ord").drop(columns="__ord")
-            st.dataframe(abertos[["IDAgenda","Data","Hora","Cliente","Serviço","Valor","Funcionário","Conta","Combo","Observação"]],
-                         use_container_width=True, hide_index=True)
+            st.dataframe(
+                abertos[["IDAgenda","Data","Hora","Cliente","Serviço","Valor","Funcionário","Conta","Combo","Observação"]],
+                use_container_width=True, hide_index=True
+            )
             st.download_button("Baixar CSV", abertos.to_csv(index=False).encode("utf-8-sig"),
                                file_name="agendamentos_em_aberto.csv", mime="text/csv")
