@@ -34,14 +34,17 @@ FUNCIONARIO_PADRAO = "Meire"
 # =========================
 # Utils
 # =========================
-def tz_now(): return datetime.now(pytz.timezone(TZ))
+def tz_now(): 
+    return datetime.now(pytz.timezone(TZ))
 
 def norm(s):
-    if not isinstance(s,str): return ""
+    if not isinstance(s,str): 
+        return ""
     s = "".join(ch for ch in unicodedata.normalize("NFKD", s.strip().lower()) if not unicodedata.combining(ch))
     return s
 
-def periodo_por_hora(hh): return "Manhã" if 5<=hh<12 else ("Tarde" if 12<=hh<18 else "Noite")
+def periodo_por_hora(hh): 
+    return "Manhã" if 5<=hh<12 else ("Tarde" if 12<=hh<18 else "Noite")
 
 def novo_id(prefix="AG"):
     return f"{prefix}-{tz_now().strftime('%Y%m%d%H%M%S')}-{''.join(random.choices(string.ascii_uppercase+string.digits,k=4))}"
@@ -59,7 +62,8 @@ def send_tg_photo(photo_url, caption):
         url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
         for chat_id in (CHAT_ID_FEMININO, CHAT_ID_JPAULO):
             r=requests.post(url, data={"chat_id":chat_id,"photo":photo_url,"caption":caption,"parse_mode":"HTML"}, timeout=10)
-            if r.status_code!=200: send_tg_msg(caption)
+            if r.status_code!=200: 
+                send_tg_msg(caption)
     except Exception:
         send_tg_msg(caption)
 
@@ -85,7 +89,8 @@ def conectar_sheets():
             or os.environ.get("GCP_SERVICE_ACCOUNT"))
     if cand is None:
         raise KeyError("Credenciais ausentes. Adicione em secrets uma das chaves: gcp_service_account / gcp_service_account_feminino / google_credentials / GCP_SERVICE_ACCOUNT")
-    if isinstance(cand,str): cand=json.loads(cand)
+    if isinstance(cand,str): 
+        cand=json.loads(cand)
     creds = Credentials.from_service_account_info(cand, scopes=[
         "https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"
     ])
@@ -94,8 +99,10 @@ def conectar_sheets():
 gc = conectar_sheets(); sh = gc.open_by_key(SHEET_ID)
 
 def abrir_ws(nome):
-    try: return sh.worksheet(nome)
-    except gspread.WorksheetNotFound: return sh.add_worksheet(title=nome, rows=3000, cols=60)
+    try: 
+        return sh.worksheet(nome)
+    except gspread.WorksheetNotFound: 
+        return sh.add_worksheet(title=nome, rows=3000, cols=60)
 
 COLS_AGENDA = [
     "IDAgenda","Data","Hora","Cliente","Serviço","Valor","Conta","Funcionário",
@@ -114,14 +121,16 @@ def carregar_df(aba):
     df=get_as_dataframe(ws, header=0, evaluate_formulas=False).dropna(how="all")
     if aba==ABA_AGENDAMENTO and not df.empty:
         for c in COLS_AGENDA:
-            if c not in df.columns: df[c]=""
+            if c not in df.columns: 
+                df[c]=""
         df=df[COLS_AGENDA]
     return df
 
 def salvar_df(aba, df):
     ws=abrir_ws(aba)
     if df.empty:
-        ws.clear(); ws.update(rowcol_to_a1(1,1), [list(df.columns)]); return
+        ws.clear(); ws.update(rowcol_to_a1(1,1), [list(df.columns)])
+        return
     ws.clear(); set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
 # -------------------------
@@ -133,16 +142,21 @@ def clientes_existentes():
     try:
         df=carregar_df(ABA_DADOS_FEM)
         if "Cliente" in df.columns:
-            [nomes.add(str(x).strip()) for x in df["Cliente"].dropna().astype(str)]
-    except: pass
+            for x in df["Cliente"].dropna().astype(str):
+                nomes.add(str(x).strip())
+    except: 
+        pass
     try:
         df2=carregar_df(ABA_STATUS_FEM)
         nome_col=None
         for c in df2.columns:
-            if norm(c) in ("cliente","nome","nome_cliente"): nome_col=c; break
+            if norm(c) in ("cliente","nome","nome_cliente"): 
+                nome_col=c; break
         if nome_col:
-            [nomes.add(str(x).strip()) for x in df2[nome_col].dropna().astype(str)]
-    except: pass
+            for x in df2[nome_col].dropna().astype(str):
+                nomes.add(str(x).strip())
+    except: 
+        pass
     return sorted(nomes, key=lambda s: norm(s))
 
 @st.cache_data(show_spinner=False)
@@ -151,9 +165,12 @@ def servicos_e_combos():
     try:
         df = carregar_df(ABA_DADOS_FEM)
         if not df.empty:
-            if "Serviço" in df.columns: servs=[s for s in df["Serviço"].dropna().astype(str) if s.strip()]
-            if "Combo"   in df.columns: combs=[c for c in df["Combo"].dropna().astype(str)   if c.strip()]
-    except: pass
+            if "Serviço" in df.columns: 
+                servs=[s for s in df["Serviço"].dropna().astype(str) if s.strip()]
+            if "Combo"   in df.columns: 
+                combs=[c for c in df["Combo"].dropna().astype(str)   if c.strip()]
+    except: 
+        pass
     servs=[(s[:1].upper()+s[1:]).strip() for s in servs]
     return sorted(set(servs), key=lambda s:norm(s)), sorted(set(combs), key=lambda s:norm(s))
 
@@ -163,19 +180,25 @@ def preco_sugerido(servico):
         if "Serviço" in df.columns and "Valor" in df.columns:
             m=df[df["Serviço"].astype(str).str.lower()==servico.lower()]
             vals=pd.to_numeric(m["Valor"], errors="coerce").dropna()
-            if not vals.empty: return round(float(vals.median()),2)
-    except: pass
+            if not vals.empty: 
+                return round(float(vals.median()),2)
+    except: 
+        pass
     return None
 
 def foto_do_cliente(cliente):
-    if not cliente: return PHOTO_FALLBACK_URL
+    if not cliente: 
+        return PHOTO_FALLBACK_URL
     try:
         df=carregar_df(ABA_STATUS_FEM)
-        if df.empty: return PHOTO_FALLBACK_URL
+        if df.empty: 
+            return PHOTO_FALLBACK_URL
         nome_col=None
         for c in df.columns:
-            if norm(c) in ("cliente","nome","nome_cliente"): nome_col=c; break
-        if not nome_col: return PHOTO_FALLBACK_URL
+            if norm(c) in ("cliente","nome","nome_cliente"): 
+                nome_col=c; break
+        if not nome_col: 
+            return PHOTO_FALLBACK_URL
         df["_k"]=df[nome_col].astype(str).apply(norm)
         linha=df[df["_k"]==norm(cliente)].head(1)
         if not linha.empty:
@@ -183,8 +206,10 @@ def foto_do_cliente(cliente):
             for c in FOTO_COL_CANDIDATES:
                 if c in df.columns:
                     u=str(row.get(c,"")).strip()
-                    if u.startswith(("http://","https://")): return u
-    except: pass
+                    if u.startswith(("http://","https://")): 
+                        return u
+    except: 
+        pass
     return PHOTO_FALLBACK_URL
 
 # --------- helpers para listas grandes (filtro simples) ----------
@@ -210,8 +235,8 @@ if acao.startswith("➕"):
     hora_ag = cB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
     funcionario = cC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
-    # ---- Cliente (NÃO imprime lista; só usa o selectbox) ----
-    _clientes = clientes_existentes()                 # não usar st.write(_clientes)!
+    # ---- Cliente
+    _clientes = clientes_existentes()
     filtro_cli = st.text_input("🔎 Filtrar clientes", placeholder="Digite parte do nome…")
     def _filter(opts, q, limit=200):
         if not q: return opts[:limit]
@@ -222,7 +247,7 @@ if acao.startswith("➕"):
     cli_txt = st.text_input("Novo cliente") if cli_sel == "(digite novo cliente)" else ""
     cliente_final = (cli_txt or cli_sel).strip()
 
-    # ---- Serviço / Valor (também sem imprimir listas) ----
+    # ---- Serviço / Valor
     _servs, _combs = servicos_e_combos()
     filtro_srv = st.text_input("🔎 Filtrar serviços", placeholder="Ex.: escova, unha…")
     servs_opts = _filter(_servs, filtro_srv, 200)
@@ -235,7 +260,7 @@ if acao.startswith("➕"):
         servico = servico[:1].upper() + servico[1:]
     valor = c2.text_input("Valor (R$)", placeholder="Ex.: 35,00")
 
-    # ---- Conta / Combo (sem imprimir listas) ----
+    # ---- Conta / Combo
     c3, c4 = st.columns([1, 1])
     conta = c3.text_input("Conta / Forma de pagamento", value="Carteira")
 
@@ -247,7 +272,7 @@ if acao.startswith("➕"):
 
     obs = st.text_area("Observação (opcional)", placeholder="Preferências, referências, etc.")
 
-    # ---- Itens do combo (mini‑tabela apenas quando combo existe) ----
+    # ---- Itens do combo
     itens_combo = []
     if combo:
         raw = [x.strip() for x in combo.split("+") if x.strip()]
@@ -270,7 +295,7 @@ if acao.startswith("➕"):
             v = None if pd.isna(r["Valor (R$)"]) else float(r["Valor (R$)"])
             itens_combo.append({"servico": r["Serviço"], "valor": v})
 
-    # ---- Salvar + Telegram ----
+    # ---- Salvar + Telegram
     if st.button("Agendar e notificar", type="primary", use_container_width=True):
         if not cliente_final:
             st.error("Informe o cliente.")
@@ -284,10 +309,13 @@ if acao.startswith("➕"):
             valor_total = None
             if combo and itens_combo:
                 soma = [i["valor"] for i in itens_combo if i["valor"] not in (None, "")]
-                if soma: valor_total = round(float(sum(soma)), 2)
+                if soma: 
+                    valor_total = round(float(sum(soma)), 2)
             if valor_total is None:
-                try: valor_total = round(float(str(valor).replace(",", ".")), 2)
-                except: valor_total = ""
+                try:
+                    valor_total = round(float(str(valor).replace(",", ".")), 2)
+                except Exception:
+                    valor_total = ""
 
             ida = novo_id("AG")
             criado_em = tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
@@ -332,9 +360,12 @@ elif acao.startswith("✅"):
     else:
         em_aberto=df_ag[df_ag["Status"]=="Agendado"].copy()
         em_aberto["Selecionar"]=False
+
         def fix_val(v):
-            try: return round(float(str(v).replace(",",".")),2)
-            except: return ""
+            try: 
+                return round(float(str(v).replace(",",".")),2)
+            except Exception: 
+                return ""
         em_aberto["Valor"]=em_aberto["Valor"].apply(fix_val)
 
         st.caption("Edite antes de confirmar. (Quando houver combo, os itens gravados serão usados.)")
@@ -353,7 +384,8 @@ elif acao.startswith("✅"):
         )
 
         c1,c2=st.columns([1,1])
-        if c1.checkbox("Marcar todos visíveis"): edit["Selecionar"]=True
+        if c1.checkbox("Marcar todos visíveis"):
+            edit["Selecionar"]=True
         if c2.button("Confirmar selecionados e lançar na Base", type="primary", use_container_width=True):
             selecionar=edit[edit["Selecionar"]==True]
             if selecionar.empty:
@@ -365,13 +397,16 @@ elif acao.startswith("✅"):
                     "Fase","Tipo","Período","StatusFiado","IDLancFiado","VencimentoFiado",
                     "DataPagamento","Fiado_Vencimento","Fiado_Status","Quitado_em","Observação"
                 ]
-                if df_base.empty: df_base=pd.DataFrame(columns=cols_base)
+                if df_base.empty: 
+                    df_base=pd.DataFrame(columns=cols_base)
 
                 novos=[]; ids=[]
                 for _,row in selecionar.iterrows():
                     data_txt=str(row["Data"]); hora_txt=str(row["Hora"])
-                    try: hh=int(hora_txt.split(":")[0])
-                    except: hh=9
+                    try: 
+                        hh=int(hora_txt.split(":")[0])
+                    except Exception: 
+                        hh=9
                     periodo=periodo_por_hora(hh)
 
                     # Se tiver ItensComboJSON => lançar 1 linha por item
@@ -379,12 +414,14 @@ elif acao.startswith("✅"):
                     try:
                         if str(row["ItensComboJSON"]).strip():
                             itens=json.loads(row["ItensComboJSON"])
-                    except: itens=[]
+                    except Exception: 
+                        itens=[]
 
                     if itens:
                         for it in itens:
                             s=str(it.get("servico","")).strip()
-                            if s: s=s[:1].upper()+s[1:]
+                            if s: 
+                                s=s[:1].upper()+s[1:]
                             v=it.get("valor",0.0) or 0.0
                             novo={
                                 "Data": data_txt,"Serviço": s,"Valor": float(v),"Conta": str(row["Conta"]).strip() or "Carteira",
@@ -395,13 +432,17 @@ elif acao.startswith("✅"):
                                 "Fiado_Vencimento":"","Fiado_Status":"","Quitado_em":"","Observação": str(row["Observação"]).strip()
                             }
                             for c in cols_base:
-                                if c not in novo: novo[c]=""
+                                if c not in novo: 
+                                    novo[c]=""
                             novos.append(novo)
                     else:
                         s=str(row["Serviço"]).strip()
-                        if s: s=s[:1].upper()+s[1:]
-                        try: v=float(str(row["Valor"]).replace(",",".")); 
-                        except: v=0.0
+                        if s: 
+                            s=s[:1].upper()+s[1:]
+                        try:
+                            v = float(str(row["Valor"]).replace(",","."))  # <-- try/except correto (multilinha)
+                        except Exception:
+                            v = 0.0
                         novo={
                             "Data": data_txt,"Serviço": s,"Valor": v,"Conta": str(row["Conta"]).strip() or "Carteira",
                             "Cliente": str(row["Cliente"]).strip(),"Combo": str(row["Combo"]).strip(),
@@ -411,7 +452,8 @@ elif acao.startswith("✅"):
                             "Fiado_Vencimento":"","Fiado_Status":"","Quitado_em":"","Observação": str(row["Observação"]).strip()
                         }
                         for c in cols_base:
-                            if c not in novo: novo[c]=""
+                            if c not in novo: 
+                                novo[c]=""
                         novos.append(novo)
 
                     ids.append(row["IDAgenda"])
@@ -447,22 +489,29 @@ elif acao.startswith("✅"):
 else:
     st.subheader("Agendamentos em aberto")
     df_ag=carregar_df(ABA_AGENDAMENTO)
-    if df_ag.empty: st.info("Nenhum agendamento cadastrado.")
+    if df_ag.empty: 
+        st.info("Nenhum agendamento cadastrado.")
     else:
         abertos=df_ag[df_ag["Status"]=="Agendado"].copy()
-        if abertos.empty: st.success("Sem agendamentos em aberto 🎉")
+        if abertos.empty: 
+            st.success("Sem agendamentos em aberto 🎉")
         else:
             def dt_key(r):
                 try:
                     d=datetime.strptime(str(r["Data"]), DATA_FMT)
                     h=datetime.strptime(str(r["Hora"]), HORA_FMT).time()
                     return datetime.combine(d.date(), h)
-                except: return datetime.max
+                except Exception: 
+                    return datetime.max
             abertos["__ord"]=abertos.apply(dt_key, axis=1)
             abertos=abertos.sort_values("__ord").drop(columns="__ord")
             st.dataframe(
                 abertos[["IDAgenda","Data","Hora","Cliente","Serviço","Valor","Funcionário","Conta","Combo","Observação"]],
                 use_container_width=True, hide_index=True
             )
-            st.download_button("Baixar CSV", abertos.to_csv(index=False).encode("utf-8-sig"),
-                               file_name="agendamentos_em_aberto.csv", mime="text/csv")
+            st.download_button(
+                "Baixar CSV", 
+                abertos.to_csv(index=False).encode("utf-8-sig"),
+                file_name="agendamentos_em_aberto.csv", 
+                mime="text/csv"
+            )
