@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 12_Fiado.py — App Feminino (Base & Fotos exclusivas + Telegram Feminino)
-# - Usa apenas as abas femininas: "Base de Dados Feminino" e "clientes_status_feminino"
-# - Roteamento Telegram: Meire → canal Feminino; demais → JP (cópia)
+# - Usa "Base de Dados Feminino" e "clientes_status_feminino"
+# - Roteamento Telegram: Meire/Daniela → canal Feminino; demais → JP (cópia)
 # - Lançar fiado, quitar por competência, cartões gravam LÍQUIDO em Valor
 
 import streamlit as st
@@ -72,9 +72,9 @@ def tg_send_photo(photo_url: str, caption: str, chat_id: str | None = None) -> b
         return tg_send(caption, chat)
 
 # =========================
-# Roteamento por funcionário (Feminino)
+# Roteamento por funcionária (Feminino)
 # =========================
-FEMININO_FUNCS = {"meire"}  # adicione outras profissionais aqui
+FEMININO_FUNCS = {"meire", "daniela"}  # ✅ agora inclui Daniela
 
 def _norm_name(s: str) -> str:
     s = unicodedata.normalize("NFKC", str(s or "").strip()).casefold()
@@ -230,7 +230,7 @@ st.title("💳 Controle de Fiado — Feminino")
 
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 ABA_BASE = "Base de Dados Feminino"          # 👈 FEMININO
-ABA_LANC = "Fiado_Lancamentos_Fem"           # pode ser separado do masculino
+ABA_LANC = "Fiado_Lancamentos_Fem"
 ABA_PAGT = "Fiado_Pagamentos_Fem"
 ABA_TAXAS = "Cartao_Taxas_Fem"
 
@@ -247,8 +247,9 @@ BASE_PAG_EXTRAS = [
 BASE_COLS_ALL = BASE_COLS_MIN + EXTRA_COLS + BASE_PAG_EXTRAS
 
 VALORES_PADRAO = {
-    "Unha pé": 25.0, "Unha mão": 25.0, "Pé/Mão": 50.0, "Designer de Henna": 30.0,
-    "Escova": 35.0, "Progressiva": 150.0
+    "Unha pé": 25.0, "Unha mão": 25.0, "Pé/Mão": 50.0,
+    "Designer de Henna": 30.0, "Escova": 35.0, "Progressiva": 150.0,
+    "Corte": 35.0, "Sobrancelhas": 15.0
 }
 
 COMISSAO_FUNCIONARIOS = set()  # vazio por padrão no Feminino (ajuste se precisar)
@@ -329,7 +330,7 @@ if acao == "➕ Lançar fiado":
             cliente = st.text_input("Ou digite o nome do cliente", "")
         combo_str = st.selectbox("Combo (use '+')", [""] + combos_exist)
         servico_unico = st.selectbox("Ou selecione um serviço (se não usar combo)", [""] + servs_exist)
-        funcionario = st.selectbox("Funcionário(a)", ["Meire","Outro"], index=0)  # 👈 foco no Feminino
+        funcionario = st.selectbox("Funcionário(a)", ["Meire", "Daniela"], index=0)  # ✅ lista atualizada
     with c2:
         data_atend = st.date_input("Data do atendimento", value=date.today())
         venc = st.date_input("Vencimento (opcional)", value=date.today())
@@ -387,7 +388,7 @@ if acao == "➕ Lançar fiado":
             st.success(f"Fiado criado para **{cliente}** — ID: {idl}.")
             st.cache_data.clear()
 
-            # Envio: destino do Feminino + cópia para JP (se diferente)
+            # Envio: Feminino + cópia para JP
             total_fmt = _fmt_brl(total)
             servicos_txt = combo_str.strip() if (combo_str and combo_str.strip()) else ("+".join(servicos) if servicos else "-")
             msg_html = (
@@ -434,10 +435,10 @@ elif acao == "💰 Registrar pagamento":
     ultima = ultima_forma_pagto_cliente(df_base_full, cliente_sel) if cliente_sel else None
     lista_contas_default = ["Pix","Dinheiro","Cartão","Transferência","Pagseguro","Mercado Pago","Nubank CNPJ",
                             "SumUp","Cielo","Stone","Getnet","Outro"]
-    contas_exist = sorted(set([*lista_contas_default]))
-    default_idx = contas_exist.index(ultima) if (ultima in contas_exist) else 0
+    contas_exist2 = sorted(set([*lista_contas_default]))
+    default_idx = contas_exist2.index(ultima) if (ultima in contas_exist2) else 0
     with colc2:
-        forma_pag = st.selectbox("Forma de pagamento (quitação)", options=contas_exist, index=default_idx)
+        forma_pag = st.selectbox("Forma de pagamento (quitação)", options=contas_exist2, index=default_idx)
 
     modo_sel = st.radio("Modo de seleção", ["Por ID (combo inteiro)", "Por linha (serviço)"], index=0, horizontal=True)
 
