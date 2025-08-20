@@ -472,24 +472,46 @@ elif acao.startswith("✅"):
             if col in em_aberto.columns: em_aberto[col] = em_aberto[col].astype(str)
         em_aberto["Valor"] = pd.to_numeric(em_aberto.get("Valor", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
 
-        # Colunas auxiliáres para confirmação
-        if "Fiado?" not in em_aberto.columns: em_aberto["Fiado?"] = False
-        if "VencimentoFiado" not in em_aberto.columns: em_aberto["VencimentoFiado"] = ""
-        if "ContaConf" not in em_aberto.columns: em_aberto["ContaConf"] = em_aberto["Conta"]
-        if "Selecionar" not in em_aberto.columns: em_aberto.insert(0, "Selecionar", False)
+        # ===== Colunas auxiliares para confirmação (tipos compatíveis com data_editor) =====
+        if "Selecionar" not in em_aberto.columns:
+            em_aberto.insert(0, "Selecionar", False)
+        if "Fiado?" not in em_aberto.columns:
+            em_aberto["Fiado?"] = False
+        if "VencimentoFiado" not in em_aberto.columns:
+            em_aberto["VencimentoFiado"] = ""
+        if "ContaConf" not in em_aberto.columns:
+            em_aberto["ContaConf"] = em_aberto.get("Conta", "")
 
-        st.caption("Selecione, edite campos básicos (Conta/Fiado) e abra a revisão por atendimento para ajustar itens/serviços e valores.")
+        # Tipos coerentes pro editor
+        em_aberto["Selecionar"] = em_aberto["Selecionar"].astype(bool)
+        em_aberto["Fiado?"] = em_aberto["Fiado?"].astype(bool)
+        em_aberto["ContaConf"] = em_aberto["ContaConf"].astype(str)
+        em_aberto["VencimentoFiado"] = em_aberto["VencimentoFiado"].astype(str)
+        em_aberto["Valor"] = pd.to_numeric(em_aberto["Valor"], errors="coerce").fillna(0.0)
+
+        cols_editor = [
+            "Selecionar","IDAgenda","Data","Hora","Cliente","Serviço","Valor",
+            "Funcionário","ContaConf","Fiado?","VencimentoFiado","Combo","Observação","ItensComboJSON"
+        ]
+        cols_editor = [c for c in cols_editor if c in em_aberto.columns]
+
         edit = st.data_editor(
-            em_aberto[["Selecionar","IDAgenda","Data","Hora","Cliente","Serviço","Valor","Funcionário","ContaConf","Fiado?","VencimentoFiado","Combo","Observação","ItensComboJSON"]],
+            em_aberto[cols_editor],
             column_config={
                 "Selecionar": st.column_config.CheckboxColumn("Selecionar"),
                 "Valor": st.column_config.NumberColumn("Total (R$)", step=0.5, format="%.2f"),
                 "ContaConf": st.column_config.TextColumn("Conta / Forma de pagamento"),
                 "Fiado?": st.column_config.CheckboxColumn("Fiado?"),
-                "VencimentoFiado": st.column_config.DateColumn("Vencimento do fiado"),
+                # Mantemos texto aqui (o date picker fica no expander por atendimento)
+                "VencimentoFiado": st.column_config.TextColumn("Vencimento do fiado (dd/mm/aaaa)"),
             },
-            disabled=["IDAgenda","Cliente","Funcionário","Combo","Observação","ItensComboJSON","Data","Hora","Serviço"],
-            use_container_width=True, height=420, key="editor_confirm"
+            disabled=[
+                c for c in ["IDAgenda","Cliente","Funcionário","Combo","Observação","ItensComboJSON","Data","Hora","Serviço"]
+                if c in cols_editor
+            ],
+            use_container_width=True,
+            height=420,
+            key="editor_confirm"
         )
 
         # ===== Blocos de revisão por agendamento selecionado =====
@@ -538,10 +560,13 @@ elif acao.startswith("✅"):
                         st.session_state[key_fiado] = bool(row.get("Fiado?") is True)
 
                     if key_venc not in st.session_state:
-                        # Se já vier vencimento do editor de cima, usa; senão hoje + 7
                         try:
                             if pd.notna(row.get("VencimentoFiado")) and str(row.get("VencimentoFiado")).strip():
-                                venc_d = pd.to_datetime(row["VencimentoFiado"]).date()
+                                # tenta parsear dd/mm/aaaa
+                                try:
+                                    venc_d = pd.to_datetime(row["VencimentoFiado"], dayfirst=True, errors="coerce").date()
+                                except Exception:
+                                    venc_d = date.today()
                             else:
                                 venc_d = date.today()
                         except Exception:
@@ -652,7 +677,6 @@ elif acao.startswith("✅"):
 
                     # Gera linhas para Base
                     if df_items.empty:
-                        # fallback mínimo para não perder o atendimento
                         s = str(row["Serviço"]).strip()
                         if s: s = s[:1].upper() + s[1:]
                         v = float(str(row["Valor"])) if str(row["Valor"]).strip() else 0.0
@@ -682,7 +706,6 @@ elif acao.startswith("✅"):
                             "Quitado_em": "",
                             "Observação": obs_txt
                         }
-                        # completa colunas faltantes
                         for c in cols_base:
                             if c not in novo: novo[c] = ""
                         novos.append(novo)
