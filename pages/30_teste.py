@@ -562,22 +562,32 @@ contas_existentes = sorted([c for c in df_2025["Conta"].dropna().astype(str).str
 combos_existentes = sorted([c for c in df_2025["Combo"].dropna().astype(str).str.strip().unique() if c])
 
 # =========================
-# FORM – Globais
+# FORM – Modo e Globais (sem duplicidade!)
 # =========================
 modo_lote = st.toggle("📦 Cadastro em Lote (vários clientes de uma vez)", value=False)
 
-col1, col2 = st.columns(2)
-with col1:
-    data = st.date_input("Data", value=datetime.today()).strftime("%d/%m/%Y")
-    conta_global = st.selectbox(
-        "Forma de Pagamento (padrão)",
-        list(dict.fromkeys(contas_existentes + ["Carteira", "Pix", "Transferência",
-                                               "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago"]))
-    )
-with col2:
-    funcionario_global = st.selectbox("Funcionário (padrão)", FUNCIONARIOS_FEM, index=0)
+# Data sempre visível
+data = st.date_input("Data", value=datetime.today()).strftime("%d/%m/%Y")
+
+if modo_lote:
+    # Mostra defaults só no MODO LOTE
+    col1, col2 = st.columns(2)
+    with col1:
+        conta_global = st.selectbox(
+            "Forma de Pagamento (padrão)",
+            list(dict.fromkeys(contas_existentes + ["Carteira", "Pix", "Transferência",
+                                                   "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago"]))
+        )
+    with col2:
+        funcionario_global = st.selectbox("Funcionário (padrão)", FUNCIONARIOS_FEM, index=0)
+    periodo_global = st.selectbox("Período do Atendimento (padrão)", ["Manhã", "Tarde", "Noite"])
     tipo = st.selectbox("Tipo", ["Serviço", "Produto"])
-periodo_global = st.selectbox("Período do Atendimento (padrão)", ["Manhã", "Tarde", "Noite"])
+else:
+    # Sem widgets duplicados no modo individual
+    conta_global = None
+    funcionario_global = None
+    periodo_global = None
+    tipo = "Serviço"  # padrão
 fase = "Dono + funcionário"
 
 # =========================
@@ -591,9 +601,18 @@ if not modo_lote:
         novo_nome = st.text_input("Ou digite um novo nome de cliente")
         cliente = novo_nome if novo_nome else cliente
 
+    # Fallbacks caso não haja "padrões" visíveis
+    conta_fallback = (contas_existentes[0] if contas_existentes else "Carteira")
+    periodo_fallback = "Manhã"
+    func_fallback = (FUNCIONARIOS_FEM[0] if FUNCIONARIOS_FEM else "Daniela")
+
     sug_conta, sug_periodo, sug_func = sugestoes_do_cliente(
-        df_existente, cliente, conta_global, periodo_global, funcionario_global
+        df_existente, cliente,
+        conta_global or conta_fallback,
+        periodo_global or periodo_fallback,
+        funcionario_global or func_fallback
     )
+
     conta = st.selectbox(
         "Forma de Pagamento",
         list(dict.fromkeys([sug_conta] + contas_existentes +
@@ -609,10 +628,14 @@ if not modo_lote:
         help=("Desabilitado para PIX/Dinheiro/Transferência." if force_off else None)
     )
 
-    funcionario = st.selectbox("Funcionário", FUNCIONARIOS_FEM,
-                               index=(FUNCIONARIOS_FEM.index(sug_func) if sug_func in FUNCIONARIOS_FEM else 0))
-    periodo_opcao = st.selectbox("Período do Atendimento", ["Manhã", "Tarde", "Noite"],
-                                 index=["Manhã", "Tarde", "Noite"].index(sug_periodo))
+    funcionario = st.selectbox(
+        "Funcionário", FUNCIONARIOS_FEM,
+        index=(FUNCIONARIOS_FEM.index(sug_func) if sug_func in FUNCIONARIOS_FEM else 0)
+    )
+    periodo_opcao = st.selectbox(
+        "Período do Atendimento", ["Manhã", "Tarde", "Noite"],
+        index=["Manhã", "Tarde", "Noite"].index(sug_periodo)
+    )
 
     ultimo = df_existente[df_existente["Cliente"] == cliente]
     ultimo = ultimo.sort_values("Data", ascending=False).iloc[0] if not ultimo.empty else None
@@ -839,7 +862,7 @@ else:
             st.selectbox(
                 f"Forma de Pagamento de {cli}",
                 list(dict.fromkeys([sug_conta] + contas_existentes +
-                                   ["Carteira", "Pix", "Transferência", "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago"]))    ,
+                                   ["Carteira", "Pix", "Transferência", "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago"])),
                 key=f"conta_{cli}"
             )
 
