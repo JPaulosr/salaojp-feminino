@@ -108,8 +108,9 @@ def send_tg_photo(photo_url, caption):
     for chat_id in (CHAT_ID_FEMININO, CHAT_ID_JPAULO):
         _telegram_photo(chat_id, photo_url, caption)
 
-def card_confirmacao(c, s, v, conta, f, d, h, obs, ida):
+def card_confirmacao(c, s, v, conta, f, d, h, obs, ida, fiado=False, venc=""):
     val = "-" if v in ("", None) else f"R$ {float(v):.2f}".replace(".", ",")
+    extra = f"\n🧾 <b>Condição:</b> {'Fiado (venc. '+venc+')' if fiado else 'Pago'}"
     return ("✅ <b>Atendimento confirmado</b>\n"
             f"👤 <b>Cliente:</b> {c}\n"
             f"🧴 <b>Serviço:</b> {s}\n"
@@ -118,7 +119,7 @@ def card_confirmacao(c, s, v, conta, f, d, h, obs, ida):
             f"🧑‍💼 <b>Funcionário:</b> {f}\n"
             f"🗓️ <b>Data/Hora:</b> {d} {h}\n"
             f"📝 <b>Obs.:</b> {obs or '-'}\n"
-            f"🏷️ <b>ID:</b> {ida}")
+            f"🏷️ <b>ID:</b> {ida}" + extra)
 
 # =========================
 # Google Sheets (com diagnóstico de permissão/ID)
@@ -461,7 +462,7 @@ if acao.startswith("➕"):
 
 # ---------- 2) CONFIRMAR ----------
 elif acao.startswith("✅"):
-    st.subheader("Confirmar atendimentos (lote)")
+    st.subheader("Confirmar atendimentos (lote) — com fiado e revisão de serviços")
     df_ag = carregar_df(ABA_AGENDAMENTO)
     if df_ag.empty or not (df_ag["Status"] == "Agendado").any():
         st.info("Nenhum agendamento em aberto.")
@@ -470,28 +471,120 @@ elif acao.startswith("✅"):
         for col in ["IDAgenda","Data","Hora","Cliente","Serviço","Funcionário","Conta","Combo","Observação","Status","Criado_em","Atendido_em","ItensComboJSON"]:
             if col in em_aberto.columns: em_aberto[col] = em_aberto[col].astype(str)
         em_aberto["Valor"] = pd.to_numeric(em_aberto.get("Valor", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-        em_aberto.insert(0, "Selecionar", False)
 
-        st.caption("Edite antes de confirmar. (Quando houver combo, os itens gravados serão usados.)")
+        # Colunas auxiliáres para confirmação
+        if "Fiado?" not in em_aberto.columns: em_aberto["Fiado?"] = False
+        if "VencimentoFiado" not in em_aberto.columns: em_aberto["VencimentoFiado"] = ""
+        if "ContaConf" not in em_aberto.columns: em_aberto["ContaConf"] = em_aberto["Conta"]
+        if "Selecionar" not in em_aberto.columns: em_aberto.insert(0, "Selecionar", False)
+
+        st.caption("Selecione, edite campos básicos (Conta/Fiado) e abra a revisão por atendimento para ajustar itens/serviços e valores.")
         edit = st.data_editor(
-            em_aberto,
+            em_aberto[["Selecionar","IDAgenda","Data","Hora","Cliente","Serviço","Valor","Funcionário","ContaConf","Fiado?","VencimentoFiado","Combo","Observação","ItensComboJSON"]],
             column_config={
                 "Selecionar": st.column_config.CheckboxColumn("Selecionar"),
                 "Valor": st.column_config.NumberColumn("Total (R$)", step=0.5, format="%.2f"),
+                "ContaConf": st.column_config.TextColumn("Conta / Forma de pagamento"),
+                "Fiado?": st.column_config.CheckboxColumn("Fiado?"),
+                "VencimentoFiado": st.column_config.DateColumn("Vencimento do fiado"),
             },
-            disabled=["IDAgenda","Data","Hora","Cliente","Funcionário","Status","Criado_em","Atendido_em","ItensComboJSON"],
-            use_container_width=True, height=460, key="editor_confirm"
+            disabled=["IDAgenda","Cliente","Funcionário","Combo","Observação","ItensComboJSON","Data","Hora","Serviço"],
+            use_container_width=True, height=420, key="editor_confirm"
         )
 
-        c1, c2 = st.columns([1, 1])
+        # ===== Blocos de revisão por agendamento selecionado =====
+        selecionar = edit[edit["Selecionar"] == True].copy()
+        if not selecionar.empty:
+            st.divider()
+            st.markdown("### Revisão detalhada por atendimento selecionado")
+            for _, row in selecionar.iterrows():
+                ida = str(row["IDAgenda"])
+                with st.expander(f"🔧 Ajustar itens/serviços — ID {ida} | {row['Cliente']} • {row['Data']} {row['Hora']}"):
+                    # Inicializa itens do editor dinâmico por ID
+                    key_items = f"items_{ida}"
+                    key_obs   = f"obs_{ida}"
+                    key_conta = f"conta_{ida}"
+                    key_fiado = f"fiado_{ida}"
+                    key_venc  = f"venc_{ida}"
+
+                    if key_items not in st.session_state:
+                        # Base inicial: ItensComboJSON se existir, senão o serviço único
+                        base_items = []
+                        try:
+                            if str(row["ItensComboJSON"]).strip():
+                                for it in json.loads(row["ItensComboJSON"]):
+                                    s = str(it.get("servico","")).strip()
+                                    if s: s = s[:1].upper() + s[1:]
+                                    v = it.get("valor", 0.0) or 0.0
+                                    base_items.append({"Serviço": s, "Valor (R$)": float(v)})
+                            else:
+                                s = str(row["Serviço"]).strip()
+                                if s: s = s[:1].upper() + s[1:]
+                                v = float(str(row["Valor"]))
+                                base_items.append({"Serviço": s, "Valor (R$)": float(v)})
+                        except Exception:
+                            pass
+                        if not base_items:
+                            base_items = [{"Serviço": "", "Valor (R$)": 0.0}]
+                        st.session_state[key_items] = pd.DataFrame(base_items)
+
+                    if key_obs not in st.session_state:
+                        st.session_state[key_obs] = str(row["Observação"]).strip()
+
+                    if key_conta not in st.session_state:
+                        st.session_state[key_conta] = str(row.get("ContaConf") or row.get("Conta") or "Carteira")
+
+                    if key_fiado not in st.session_state:
+                        st.session_state[key_fiado] = bool(row.get("Fiado?") is True)
+
+                    if key_venc not in st.session_state:
+                        # Se já vier vencimento do editor de cima, usa; senão hoje + 7
+                        try:
+                            if pd.notna(row.get("VencimentoFiado")) and str(row.get("VencimentoFiado")).strip():
+                                venc_d = pd.to_datetime(row["VencimentoFiado"]).date()
+                            else:
+                                venc_d = date.today()
+                        except Exception:
+                            venc_d = date.today()
+                        st.session_state[key_venc] = venc_d
+
+                    # Campos editáveis
+                    st.write("Edite os itens abaixo (adicione/remova linhas conforme necessário):")
+                    df_items = st.data_editor(
+                        st.session_state[key_items],
+                        key=f"editor_items_{ida}",
+                        num_rows="dynamic",
+                        column_config={
+                            "Serviço": st.column_config.TextColumn("Serviço"),
+                            "Valor (R$)": st.column_config.NumberColumn("Valor (R$)", step=0.5, format="%.2f"),
+                        },
+                        use_container_width=True
+                    )
+                    st.session_state[key_items] = df_items
+
+                    cA, cB, cC = st.columns([1,1,2])
+                    st.session_state[key_conta] = cA.text_input("Conta / Forma de pagamento", value=st.session_state[key_conta], key=f"conta_input_{ida}")
+                    st.session_state[key_fiado] = cB.checkbox("Fiado?", value=st.session_state[key_fiado], key=f"fiado_chk_{ida}")
+                    if st.session_state[key_fiado]:
+                        st.session_state[key_venc] = cC.date_input("Vencimento do fiado", value=st.session_state[key_venc], key=f"venc_input_{ida}")
+                    else:
+                        cC.markdown("<small>Pagamento à vista (será gravado com DataPagamento = hoje)</small>", unsafe_allow_html=True)
+
+                    st.session_state[key_obs] = st.text_area("Observação", value=st.session_state[key_obs], key=f"obs_input_{ida}")
+
+        c1, c2, c3 = st.columns([1,1,2])
         if c1.checkbox("Marcar todos visíveis"):
             edit["Selecionar"] = True
+            selecionar = edit.copy()
 
-        if c2.button("Confirmar selecionados e lançar na Base", type="primary", use_container_width=True):
-            selecionar = edit[edit["Selecionar"] == True]
+        salvar_btn = c2.button("Confirmar selecionados e lançar na Base", type="primary", use_container_width=True)
+
+        if salvar_btn:
+            selecionar = edit[edit["Selecionar"] == True].copy()
             if selecionar.empty:
                 st.warning("Selecione pelo menos um agendamento.")
             else:
+                # Carrega/garante Base de Dados Feminino
                 df_base = carregar_df(ABA_DADOS_FEM)
                 cols_base = list(df_base.columns) if not df_base.empty else [
                     "Data","Serviço","Valor","Conta","Cliente","Combo","Funcionário",
@@ -502,7 +595,11 @@ elif acao.startswith("✅"):
                     df_base = pd.DataFrame(columns=cols_base)
 
                 novos, ids = [], []
+                hoje_txt = tz_now().strftime(DATA_FMT)
+                agora_txt = tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
+
                 for _, row in selecionar.iterrows():
+                    ida = str(row["IDAgenda"])
                     data_txt = str(row["Data"]); hora_txt = str(row["Hora"])
                     try:
                         hh = int(hora_txt.split(":")[0])
@@ -510,73 +607,136 @@ elif acao.startswith("✅"):
                         hh = 9
                     periodo = periodo_por_hora(hh)
 
-                    itens = []
-                    try:
-                        if str(row["ItensComboJSON"]).strip():
-                            itens = json.loads(row["ItensComboJSON"])
-                    except Exception:
-                        itens = []
+                    # Recupera ajustes feitos no bloco de revisão (se aberto)
+                    key_items = f"items_{ida}"
+                    key_obs   = f"obs_{ida}"
+                    key_conta = f"conta_{ida}"
+                    key_fiado = f"fiado_{ida}"
+                    key_venc  = f"venc_{ida}"
 
-                    if itens:
-                        for it in itens:
-                            s = str(it.get("servico","")).strip()
-                            if s: s = s[:1].upper() + s[1:]
-                            v = it.get("valor", 0.0) or 0.0
-                            novo = {
-                                "Data": data_txt, "Serviço": s, "Valor": float(v), "Conta": str(row["Conta"]).strip() or "Carteira",
-                                "Cliente": str(row["Cliente"]).strip(), "Combo": str(row["Combo"]).strip(),
-                                "Funcionário": str(row["Funcionário"]).strip() or FUNCIONARIO_PADRAO,
-                                "Fase": "Dono + funcionário", "Tipo": "Serviço", "Período": periodo,
-                                "StatusFiado": "", "IDLancFiado": "", "VencimentoFiado": "", "DataPagamento": "",
-                                "Fiado_Vencimento": "", "Fiado_Status": "", "Quitado_em": "", "Observação": str(row["Observação"]).strip()
-                            }
-                            for c in cols_base:
-                                if c not in novo: novo[c] = ""
-                            novos.append(novo)
+                    # Fallbacks: se não revisou manualmente, usa o que está na linha (combo itens ou serviço único)
+                    if key_items in st.session_state:
+                        df_items = st.session_state[key_items].copy()
                     else:
+                        base_items = []
+                        try:
+                            if str(row["ItensComboJSON"]).strip():
+                                for it in json.loads(row["ItensComboJSON"]):
+                                    s = str(it.get("servico","")).strip()
+                                    if s: s = s[:1].upper() + s[1:]
+                                    v = it.get("valor", 0.0) or 0.0
+                                    base_items.append({"Serviço": s, "Valor (R$)": float(v)})
+                            else:
+                                s = str(row["Serviço"]).strip()
+                                if s: s = s[:1].upper() + s[1:]
+                                v = float(str(row["Valor"]))
+                                base_items.append({"Serviço": s, "Valor (R$)": float(v)})
+                        except Exception:
+                            base_items = [{"Serviço":"", "Valor (R$)":0.0}]
+                        df_items = pd.DataFrame(base_items)
+
+                    # Normaliza itens (remove linhas vazias)
+                    df_items["Serviço"] = df_items["Serviço"].astype(str).str.strip()
+                    df_items["Serviço"] = df_items["Serviço"].apply(lambda s: (s[:1].upper() + s[1:]) if s else s)
+                    df_items["Valor (R$)"] = pd.to_numeric(df_items["Valor (R$)"], errors="coerce").fillna(0.0)
+                    df_items = df_items[df_items["Serviço"] != ""].reset_index(drop=True)
+
+                    conta_escolhida = st.session_state.get(key_conta, str(row.get("ContaConf") or row.get("Conta") or "Carteira")).strip() or "Carteira"
+                    fiado_flag = bool(st.session_state.get(key_fiado, bool(row.get("Fiado?") is True)))
+                    try:
+                        venc_dt = st.session_state.get(key_venc, date.today())
+                        venc_txt = venc_dt.strftime(DATA_FMT) if isinstance(venc_dt, date) else str(venc_dt)
+                    except Exception:
+                        venc_txt = hoje_txt
+                    obs_txt = st.session_state.get(key_obs, str(row["Observação"]).strip())
+
+                    # Gera linhas para Base
+                    if df_items.empty:
+                        # fallback mínimo para não perder o atendimento
                         s = str(row["Serviço"]).strip()
                         if s: s = s[:1].upper() + s[1:]
-                        try:
-                            v = float(str(row["Valor"]).replace(",", "."))
-                        except Exception:
-                            v = 0.0
+                        v = float(str(row["Valor"])) if str(row["Valor"]).strip() else 0.0
+                        df_items = pd.DataFrame([{"Serviço": s, "Valor (R$)": v}])
+
+                    for _, it in df_items.iterrows():
+                        s_item = str(it["Serviço"]).strip()
+                        v_item = float(it["Valor (R$)"]) if it["Valor (R$)"] not in (None, "") else 0.0
+
                         novo = {
-                            "Data": data_txt, "Serviço": s, "Valor": v, "Conta": str(row["Conta"]).strip() or "Carteira",
-                            "Cliente": str(row["Cliente"]).strip(), "Combo": str(row["Combo"]).strip(),
+                            "Data": data_txt,
+                            "Serviço": s_item,
+                            "Valor": v_item,
+                            "Conta": conta_escolhida,
+                            "Cliente": str(row["Cliente"]).strip(),
+                            "Combo": str(row["Combo"]).strip(),
                             "Funcionário": str(row["Funcionário"]).strip() or FUNCIONARIO_PADRAO,
-                            "Fase": "Dono + funcionário", "Tipo": "Serviço", "Período": periodo,
-                            "StatusFiado": "", "IDLancFiado": "", "VencimentoFiado": "", "DataPagamento": "",
-                            "Fiado_Vencimento": "", "Fiado_Status": "", "Quitado_em": "", "Observação": str(row["Observação"]).strip()
+                            "Fase": "Dono + funcionário",
+                            "Tipo": "Serviço",
+                            "Período": periodo,
+                            "StatusFiado": ("Aberto" if fiado_flag else ""),
+                            "IDLancFiado": "",
+                            "VencimentoFiado": (venc_txt if fiado_flag else ""),
+                            "DataPagamento": ("" if fiado_flag else hoje_txt),
+                            "Fiado_Vencimento": (venc_txt if fiado_flag else ""),
+                            "Fiado_Status": ("A receber" if fiado_flag else ""),
+                            "Quitado_em": "",
+                            "Observação": obs_txt
                         }
+                        # completa colunas faltantes
                         for c in cols_base:
                             if c not in novo: novo[c] = ""
                         novos.append(novo)
 
-                    ids.append(row["IDAgenda"])
+                    ids.append(ida)
 
+                # Persiste na Base
                 df_base = pd.concat([df_base, pd.DataFrame(novos)], ignore_index=True)
                 salvar_df(ABA_DADOS_FEM, df_base)
 
+                # Atualiza agendamentos
                 df_ag = carregar_df(ABA_AGENDAMENTO)
-                agora = tz_now().strftime(f"{DATA_FMT} {HORA_FMT}")
                 df_ag.loc[df_ag["IDAgenda"].isin(ids), "Status"] = "Atendido"
-                df_ag.loc[df_ag["IDAgenda"].isin(ids), "Atendido_em"] = agora
+                df_ag.loc[df_ag["IDAgenda"].isin(ids), "Atendido_em"] = agora_txt
                 salvar_df(ABA_AGENDAMENTO, df_ag)
 
+                # Telegram por atendimento
                 for _, row in selecionar.iterrows():
+                    ida = str(row["IDAgenda"])
+                    key_items = f"items_{ida}"
+                    key_conta = f"conta_{ida}"
+                    key_fiado = f"fiado_{ida}"
+                    key_venc  = f"venc_{ida}"
+
+                    conta_escolhida = st.session_state.get(key_conta, str(row.get("ContaConf") or row.get("Conta") or "Carteira")).strip() or "Carteira"
+                    fiado_flag = bool(st.session_state.get(key_fiado, bool(row.get("Fiado?") is True)))
+                    try:
+                        venc_dt = st.session_state.get(key_venc, date.today())
+                        venc_txt = venc_dt.strftime(DATA_FMT) if isinstance(venc_dt, date) else str(venc_dt)
+                    except Exception:
+                        venc_txt = tz_now().strftime(DATA_FMT)
+
+                    # total p/ card
+                    if key_items in st.session_state:
+                        df_items = st.session_state[key_items].copy()
+                    else:
+                        df_items = pd.DataFrame([{"Serviço": str(row["Serviço"]).strip(), "Valor (R$)": float(str(row["Valor"]))}])
+                    df_items["Valor (R$)"] = pd.to_numeric(df_items["Valor (R$)"], errors="coerce").fillna(0.0)
+                    total_val = float(df_items["Valor (R$)"].sum())
+
                     foto = foto_do_cliente(str(row["Cliente"]).strip()) or PHOTO_FALLBACK_URL
                     caption = card_confirmacao(
                         c=str(row["Cliente"]).strip(),
                         s=(str(row["Serviço"]).strip() or f"Combo: {row['Combo']}"),
-                        v=row["Valor"], conta=str(row["Conta"]).strip() or "Carteira",
+                        v=total_val, conta=conta_escolhida,
                         f=str(row["Funcionário"]).strip() or FUNCIONARIO_PADRAO,
                         d=str(row["Data"]), h=str(row["Hora"]),
-                        obs=str(row["Observação"]).strip(), ida=str(row["IDAgenda"])
+                        obs=str(row["Observação"]).strip(), ida=ida,
+                        fiado=fiado_flag, venc=venc_txt
                     )
                     send_tg_photo(foto, caption)
 
-                send_tg_msg(f"🧾 <b>Resumo</b>: {len(ids)} atendimento(s) confirmado(s) e lançados na Base de Dados Feminino.")
-                st.success(f"{len(ids)} atendimento(s) confirmados, linhas geradas (combo) e cards enviados.")
+                send_tg_msg(f"🧾 <b>Resumo</b>: {len(ids)} atendimento(s) confirmado(s) (fiado/à vista) e lançados na Base de Dados Feminino.")
+                st.success(f"{len(ids)} atendimento(s) confirmados com sucesso. Registros gravados e cards enviados.")
 
 # ---------- 3) EM ABERTO ----------
 else:
