@@ -366,15 +366,23 @@ if acao.startswith("➕"):
                         "Observação": obs_nova.strip()
                     }])], ignore_index=True)
 
-                salvar_df(ABA_STATUS_FEM, df_status)
-                st.success(f"Cliente '{nome_novo.strip()}' salvo com sucesso!")
-                # limpa cache e preseleciona o novo cliente
-                try:
-                    clientes_existentes.clear()
-                except Exception:
-                    pass
-                st.session_state["cliente_recem_cadastrado"] = nome_novo.strip()
-                st.experimental_rerun()
+               salvar_df(ABA_STATUS_FEM, df_status)
+st.success(f"Cliente '{nome_novo.strip()}' salvo com sucesso!")
+
+# limpa cache e preseleciona o novo cliente
+try:
+    clientes_existentes.clear()
+except Exception:
+    pass
+st.session_state["cliente_recem_cadastrado"] = nome_novo.strip()
+
+# ✅ Rerun compatível (Streamlit novo/antigo)
+_rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+if _rerun:
+    _rerun()
+else:
+    st.info("Atualize a página para ver o cliente na lista.")
+
 
     # Cliente: somente cadastrados (base + status feminino)
     clientes_opts = clientes_existentes()
