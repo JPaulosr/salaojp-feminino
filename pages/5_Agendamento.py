@@ -63,20 +63,14 @@ def normalize_photo_url(u: str) -> str:
     if not isinstance(u, str) or not u:
         return PHOTO_FALLBACK_URL
     u = u.strip()
-
-    # 1) https://drive.google.com/file/d/<ID>/view?...  -> uc?export=view&id=<ID>
     m = re.search(r"drive\.google\.com/file/d/([^/]+)/", u)
     if m:
         file_id = m.group(1)
         return f"https://drive.google.com/uc?export=view&id={file_id}"
-
-    # 2) https://drive.google.com/open?id=<ID>  ou uc?id=<ID>
     m = re.search(r"drive\.google\.com/(?:open|uc)\?[^#]*id=([^&]+)", u)
     if m:
         file_id = m.group(1)
         return f"https://drive.google.com/uc?export=view&id={file_id}"
-
-    # 3) já direto (Cloudinary, lh3.googleusercontent etc.)
     return u
 
 def check_url_ok(url: str) -> bool:
@@ -98,7 +92,6 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     send_photo_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     send_text_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    # 1) Tenta direto por URL
     try:
         r = requests.post(
             send_photo_url,
@@ -110,7 +103,6 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     except Exception:
         pass
 
-    # 2) Baixa e envia como arquivo
     try:
         if check_url_ok(photo_url):
             img = requests.get(photo_url, timeout=10).content
@@ -122,7 +114,6 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     except Exception:
         pass
 
-    # 3) Fallback texto
     try:
         requests.post(send_text_url, json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML"}, timeout=10)
     except Exception:
@@ -181,6 +172,23 @@ def garantir_estrutura_agenda():
     if df.empty or any(c not in df.columns for c in COLS_AGENDA):
         ws.clear(); ws.update(rowcol_to_a1(1,1), [COLS_AGENDA])
 garantir_estrutura_agenda()
+
+# >>> NOVO: garante a estrutura da aba de status feminino
+def garantir_estrutura_status_fem():
+    ws = abrir_ws(ABA_STATUS_FEM)
+    df = get_as_dataframe(ws, header=0, evaluate_formulas=False).dropna(how="all")
+    base = ["Cliente","Status","Foto","Observação"]
+    if df.empty:
+        ws.clear(); ws.update(rowcol_to_a1(1,1), [base]); return
+    changed = False
+    for c in base:
+        if c not in df.columns:
+            df[c] = ""
+            changed = True
+    if changed:
+        # mantém as colunas existentes, colocando as bases primeiro
+        outros = [c for c in df.columns if c not in base]
+        set_with_dataframe(ws, df[base + outros], include_index=False, include_column_header=True, resize=True)
 
 def carregar_df(aba):
     ws = abrir_ws(aba)
@@ -320,12 +328,66 @@ if acao.startswith("➕"):
     hora_ag = cB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
     funcionario = cC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
+    # >>> NOVO: Cadastro rápido de cliente
+    garantir_estrutura_status_fem()
+    with st.expander("➕ Cadastrar novo cliente"):
+        with st.form("cad_cliente_form", clear_on_submit=False):
+            nome_novo = st.text_input("Nome do cliente *")
+            status_novo = st.selectbox("Status", ["Ativo","Inativo"], index=0)
+            foto_nova = st.text_input("Foto (URL) — opcional", placeholder="https://... (Drive/Cloudinary)")
+            obs_nova  = st.text_area("Observação (opcional)")
+            bt_cad = st.form_submit_button("Salvar cliente")
+
+        if bt_cad:
+            if not nome_novo.strip():
+                st.error("Informe o nome do cliente.")
+            else:
+                # carrega e garante colunas
+                df_status = carregar_df(ABA_STATUS_FEM)
+                if df_status.empty:
+                    df_status = pd.DataFrame(columns=["Cliente","Status","Foto","Observação"])
+                for c in ["Cliente","Status","Foto","Observação"]:
+                    if c not in df_status.columns:
+                        df_status[c] = ""
+
+                # atualiza se já existir (comparação por norm), senão insere
+                chave = df_status["Cliente"].astype(str).apply(norm)
+                m = chave == norm(nome_novo)
+                if m.any():
+                    idx = m.idxmax()
+                    df_status.loc[idx, "Status"] = status_novo
+                    df_status.loc[idx, "Foto"] = foto_nova.strip()
+                    df_status.loc[idx, "Observação"] = obs_nova.strip()
+                else:
+                    df_status = pd.concat([df_status, pd.DataFrame([{
+                        "Cliente": nome_novo.strip(),
+                        "Status": status_novo,
+                        "Foto": foto_nova.strip(),
+                        "Observação": obs_nova.strip()
+                    }])], ignore_index=True)
+
+                salvar_df(ABA_STATUS_FEM, df_status)
+                st.success(f"Cliente '{nome_novo.strip()}' salvo com sucesso!")
+                # limpa cache e preseleciona o novo cliente
+                try:
+                    clientes_existentes.clear()
+                except Exception:
+                    pass
+                st.session_state["cliente_recem_cadastrado"] = nome_novo.strip()
+                st.experimental_rerun()
+
     # Cliente: somente cadastrados (base + status feminino)
     clientes_opts = clientes_existentes()
     if not clientes_opts:
         st.error("Nenhum cliente encontrado. Cadastre clientes em 'clientes_status_feminino' ou na Base.")
         st.stop()
-    cliente_final = st.selectbox("Cliente", clientes_opts)
+
+    # preseleciona o recém cadastrado, se houver
+    idx_default = 0
+    novo = st.session_state.get("cliente_recem_cadastrado")
+    if novo and novo in clientes_opts:
+        idx_default = clientes_opts.index(novo)
+    cliente_final = st.selectbox("Cliente", clientes_opts, index=idx_default)
 
     # Serviços / Combos: somente os existentes
     _servs, _combs = servicos_e_combos()
@@ -418,6 +480,9 @@ if acao.startswith("➕"):
             f"{det}"
         )
         send_tg_photo(foto_url, caption)
+        # limpa seleção pós-agendamento
+        if "cliente_recem_cadastrado" in st.session_state:
+            del st.session_state["cliente_recem_cadastrado"]
         st.success("Agendado e notificado com sucesso ✅")
 
 # ---------- 2) CONFIRMAR ----------
