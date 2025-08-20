@@ -21,7 +21,6 @@ TZ = "America/Sao_Paulo"
 DATA_FMT = "%d/%m/%Y"; HORA_FMT = "%H:%M:%S"
 
 PHOTO_FALLBACK_URL = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
-# nomes possíveis para a coluna de foto (comparação com normalização)
 FOTO_COL_CANDIDATES = ["link_foto","foto","imagem","url_foto","foto_link","link","image","foto_url"]
 
 # Telegram
@@ -59,7 +58,6 @@ def send_tg_msg(text):
 
 # ----------- FOTO: Normalização + Verificação + Envio robusto -----------
 def normalize_photo_url(u: str) -> str:
-    """Converte links do Google Drive em links diretos quando possível."""
     if not isinstance(u, str) or not u:
         return PHOTO_FALLBACK_URL
     u = u.strip()
@@ -74,37 +72,23 @@ def normalize_photo_url(u: str) -> str:
     return u
 
 def check_url_ok(url: str) -> bool:
-    """HEAD/GET rápido para saber se a URL está acessível publicamente."""
     try:
         r = requests.head(url, timeout=6, allow_redirects=True)
-        if r.status_code == 405:  # alguns hosts bloqueiam HEAD
+        if r.status_code == 405:
             r = requests.get(url, timeout=8, stream=True)
         return r.status_code == 200
     except Exception:
         return False
 
 def _telegram_photo(chat_id: str, photo_url: str, caption: str):
-    """
-    1) Tenta enviar a URL.
-    2) Se falhar, tenta baixar e enviar como arquivo (multipart).
-    3) Se falhar, envia só texto (fallback).
-    """
     send_photo_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     send_text_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    # 1) Tenta direto por URL
     try:
-        r = requests.post(
-            send_photo_url,
-            json={"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"},
-            timeout=12
-        )
+        r = requests.post(send_photo_url, json={"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}, timeout=12)
         if r.status_code == 200:
             return
     except Exception:
         pass
-
-    # 2) Baixa e envia como arquivo
     try:
         if check_url_ok(photo_url):
             img = requests.get(photo_url, timeout=10).content
@@ -115,8 +99,6 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
                 return
     except Exception:
         pass
-
-    # 3) Fallback texto
     try:
         requests.post(send_text_url, json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML"}, timeout=10)
     except Exception:
@@ -139,10 +121,13 @@ def card_confirmacao(c, s, v, conta, f, d, h, obs, ida):
             f"🏷️ <b>ID:</b> {ida}")
 
 # =========================
-# Google Sheets
+# Google Sheets (com diagnóstico de permissão/ID)
 # =========================
+SERVICE_EMAIL = None  # preenchido em conectar_sheets()
+
 @st.cache_resource(show_spinner=False)
 def conectar_sheets():
+    global SERVICE_EMAIL
     cand = (st.secrets.get("gcp_service_account") or st.secrets.get("gcp_service_account_feminino")
             or st.secrets.get("google_credentials") or st.secrets.get("GCP_SERVICE_ACCOUNT")
             or os.environ.get("GCP_SERVICE_ACCOUNT"))
@@ -150,13 +135,29 @@ def conectar_sheets():
         raise KeyError("Credenciais ausentes. Adicione em secrets uma das chaves: gcp_service_account / gcp_service_account_feminino / google_credentials / GCP_SERVICE_ACCOUNT")
     if isinstance(cand, str):
         cand = json.loads(cand)
+    SERVICE_EMAIL = cand.get("client_email", "—")
     creds = Credentials.from_service_account_info(cand, scopes=[
-        "https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
     ])
     return gspread.authorize(creds)
 
-gc = conectar_sheets()
-sh = gc.open_by_key(SHEET_ID)
+# Abre a planilha com tratamento de erro
+try:
+    gc = conectar_sheets()
+    sh = gc.open_by_key(SHEET_ID)
+except gspread.exceptions.APIError as e:
+    st.error(
+        "❌ Não consegui abrir a planilha pelo ID.\n\n"
+        "Verifique:\n"
+        f"• Compartilhe a planilha com este e-mail (Editor): **{SERVICE_EMAIL}**\n"
+        f"• Confirme se o `SHEET_ID` está correto: `{SHEET_ID}`\n"
+        "• O arquivo não foi excluído/movido."
+    )
+    st.stop()
+except Exception as e:
+    st.error(f"Falha ao conectar no Google Sheets: {e}")
+    st.stop()
 
 def abrir_ws(nome):
     try:
@@ -176,7 +177,6 @@ def garantir_estrutura_agenda():
         ws.clear(); ws.update(rowcol_to_a1(1,1), [COLS_AGENDA])
 garantir_estrutura_agenda()
 
-# >>> NOVO: garante a estrutura da aba de status feminino
 def garantir_estrutura_status_fem():
     ws = abrir_ws(ABA_STATUS_FEM)
     df = get_as_dataframe(ws, header=0, evaluate_formulas=False).dropna(how="all")
@@ -246,7 +246,6 @@ def servicos_e_combos():
     return sorted(set(servs), key=lambda s: norm(s)), sorted(set(combs), key=lambda s: norm(s))
 
 def preco_sugerido(servico):
-    """Mediana de AGOSTO/2025 para o serviço."""
     try:
         df = carregar_df(ABA_DADOS_FEM)
         if {"Data","Serviço","Valor"}.issubset(df.columns):
@@ -261,55 +260,37 @@ def preco_sugerido(servico):
     return None
 
 def foto_do_cliente(cliente: str) -> str:
-    """
-    Busca a URL da foto do cliente na aba 'clientes_status_feminino'.
-    Identifica a coluna de foto por normalização (case-insensitive / acentos).
-    Normaliza links do Drive para visualização direta. Se não achar, usa fallback.
-    """
     def _norm(s: str) -> str:
         if not isinstance(s, str): return ""
         return "".join(ch for ch in unicodedata.normalize("NFKD", s.strip().lower()) if not unicodedata.combining(ch))
-
     if not cliente:
         return PHOTO_FALLBACK_URL
-
     try:
         df = carregar_df(ABA_STATUS_FEM)
         if df.empty:
             return PHOTO_FALLBACK_URL
-
-        # coluna do nome
         nome_col = None
         for col in df.columns:
             if _norm(col) in ("cliente","nome","nome_cliente"):
-                nome_col = col
-                break
+                nome_col = col; break
         if not nome_col:
             return PHOTO_FALLBACK_URL
-
-        # coluna da foto
         foto_col = None
         cand_norm = {_norm(x) for x in FOTO_COL_CANDIDATES}
         for col in df.columns:
             if _norm(col) in cand_norm:
-                foto_col = col
-                break
+                foto_col = col; break
         if not foto_col:
             return PHOTO_FALLBACK_URL
-
-        # procura a linha do cliente
         df["_k"] = df[nome_col].astype(str).apply(_norm)
         row = df[df["_k"] == _norm(cliente)].head(1)
         if row.empty:
             return PHOTO_FALLBACK_URL
-
         url = str(row.iloc[0][foto_col]).strip()
         if not url.startswith(("http://","https://")):
             return PHOTO_FALLBACK_URL
-
         url = normalize_photo_url(url)
         return url or PHOTO_FALLBACK_URL
-
     except Exception as e:
         print("foto_do_cliente erro:", e)
         return PHOTO_FALLBACK_URL
@@ -330,7 +311,7 @@ if acao.startswith("➕"):
     hora_ag = cB.time_input("Hora", value=dt_time(9, 0, 0), step=300)
     funcionario = cC.selectbox("Funcionário", options=FUNCIONARIOS_FEM, index=FUNCIONARIOS_FEM.index(FUNCIONARIO_PADRAO))
 
-    # >>> NOVO: Cadastro rápido de cliente
+    # >>> Cadastro rápido de cliente
     garantir_estrutura_status_fem()
     with st.expander("➕ Cadastrar novo cliente"):
         with st.form("cad_cliente_form", clear_on_submit=False):
@@ -344,15 +325,12 @@ if acao.startswith("➕"):
             if not nome_novo.strip():
                 st.error("Informe o nome do cliente.")
             else:
-                # carrega e garante colunas
                 df_status = carregar_df(ABA_STATUS_FEM)
                 if df_status.empty:
                     df_status = pd.DataFrame(columns=["Cliente","Status","Foto","Observação"])
                 for c in ["Cliente","Status","Foto","Observação"]:
                     if c not in df_status.columns:
                         df_status[c] = ""
-
-                # atualiza se já existir, senão insere
                 chave = df_status["Cliente"].astype(str).apply(norm)
                 m = chave == norm(nome_novo)
                 if m.any():
@@ -367,18 +345,13 @@ if acao.startswith("➕"):
                         "Foto": foto_nova.strip(),
                         "Observação": obs_nova.strip()
                     }])], ignore_index=True)
-
                 salvar_df(ABA_STATUS_FEM, df_status)
                 st.success(f"Cliente '{nome_novo.strip()}' salvo com sucesso!")
-
-                # limpa cache e preseleciona o novo cliente
                 try:
                     clientes_existentes.clear()
                 except Exception:
                     pass
                 st.session_state["cliente_recem_cadastrado"] = nome_novo.strip()
-
-                # ✅ Rerun compatível (Streamlit novo/antigo)
                 _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
                 if callable(_rerun):
                     _rerun()
@@ -390,15 +363,13 @@ if acao.startswith("➕"):
     if not clientes_opts:
         st.error("Nenhum cliente encontrado. Cadastre clientes em 'clientes_status_feminino' ou na Base.")
         st.stop()
-
-    # preseleciona o recém cadastrado, se houver
     idx_default = 0
     novo = st.session_state.get("cliente_recem_cadastrado")
     if novo and novo in clientes_opts:
         idx_default = clientes_opts.index(novo)
     cliente_final = st.selectbox("Cliente", clientes_opts, index=idx_default)
 
-    # Serviços / Combos: somente os existentes
+    # Serviços / Combos
     _servs, _combs = servicos_e_combos()
     if not _servs:
         st.error("Nenhum serviço encontrado na Base de Dados Feminino.")
@@ -406,11 +377,7 @@ if acao.startswith("➕"):
     c1, c2 = st.columns([2, 1])
     servico = c1.selectbox("Serviço", _servs)
     valor_sugerido = preco_sugerido(servico)
-    valor_txt = c2.text_input(
-        "Valor (R$)", 
-        value=("" if valor_sugerido is None else f"{valor_sugerido:.2f}".replace(".", ",")),
-        placeholder="Ex.: 35,00"
-    )
+    valor_txt = c2.text_input("Valor (R$)", value=("" if valor_sugerido is None else f"{valor_sugerido:.2f}".replace(".", ",")), placeholder="Ex.: 35,00")
 
     c3, c4 = st.columns([1, 1])
     conta = c3.text_input("Conta / Forma de pagamento", value="Carteira")
@@ -418,7 +385,7 @@ if acao.startswith("➕"):
 
     obs = st.text_area("Observação (opcional)")
 
-    # Itens do combo quando combo existir (edite os valores)
+    # Itens do combo
     itens_combo = []
     if combo:
         raw = [x.strip() for x in combo.split("+") if x.strip()]
@@ -445,7 +412,6 @@ if acao.startswith("➕"):
         garantir_estrutura_agenda()
         df_ag = carregar_df(ABA_AGENDAMENTO)
 
-        # total do combo = soma itens; se não houver, usa campo "Valor"
         valor_total = None
         if combo and itens_combo:
             soma = [i["valor"] for i in itens_combo if i["valor"] not in (None, "")]
@@ -489,7 +455,6 @@ if acao.startswith("➕"):
             f"{det}"
         )
         send_tg_photo(foto_url, caption)
-        # limpa seleção pós-agendamento
         if "cliente_recem_cadastrado" in st.session_state:
             del st.session_state["cliente_recem_cadastrado"]
         st.success("Agendado e notificado com sucesso ✅")
@@ -502,12 +467,9 @@ elif acao.startswith("✅"):
         st.info("Nenhum agendamento em aberto.")
     else:
         em_aberto = df_ag[df_ag["Status"] == "Agendado"].copy()
-
-        # Normalização de tipos -> previne erro do data_editor
         for col in ["IDAgenda","Data","Hora","Cliente","Serviço","Funcionário","Conta","Combo","Observação","Status","Criado_em","Atendido_em","ItensComboJSON"]:
             if col in em_aberto.columns: em_aberto[col] = em_aberto[col].astype(str)
         em_aberto["Valor"] = pd.to_numeric(em_aberto.get("Valor", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-
         em_aberto.insert(0, "Selecionar", False)
 
         st.caption("Edite antes de confirmar. (Quando houver combo, os itens gravados serão usados.)")
