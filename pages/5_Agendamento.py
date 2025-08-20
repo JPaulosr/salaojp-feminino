@@ -92,6 +92,7 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     send_photo_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     send_text_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
+    # 1) Tenta direto por URL
     try:
         r = requests.post(
             send_photo_url,
@@ -103,6 +104,7 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     except Exception:
         pass
 
+    # 2) Baixa e envia como arquivo
     try:
         if check_url_ok(photo_url):
             img = requests.get(photo_url, timeout=10).content
@@ -114,6 +116,7 @@ def _telegram_photo(chat_id: str, photo_url: str, caption: str):
     except Exception:
         pass
 
+    # 3) Fallback texto
     try:
         requests.post(send_text_url, json={"chat_id": chat_id, "text": caption, "parse_mode": "HTML"}, timeout=10)
     except Exception:
@@ -186,7 +189,6 @@ def garantir_estrutura_status_fem():
             df[c] = ""
             changed = True
     if changed:
-        # mantém as colunas existentes, colocando as bases primeiro
         outros = [c for c in df.columns if c not in base]
         set_with_dataframe(ws, df[base + outros], include_index=False, include_column_header=True, resize=True)
 
@@ -276,7 +278,7 @@ def foto_do_cliente(cliente: str) -> str:
         if df.empty:
             return PHOTO_FALLBACK_URL
 
-        # coluna do nome (Cliente / Nome / Nome_Cliente...)
+        # coluna do nome
         nome_col = None
         for col in df.columns:
             if _norm(col) in ("cliente","nome","nome_cliente"):
@@ -285,7 +287,7 @@ def foto_do_cliente(cliente: str) -> str:
         if not nome_col:
             return PHOTO_FALLBACK_URL
 
-        # coluna da foto (ex.: "Foto", "foto", "Imagem"...)
+        # coluna da foto
         foto_col = None
         cand_norm = {_norm(x) for x in FOTO_COL_CANDIDATES}
         for col in df.columns:
@@ -350,7 +352,7 @@ if acao.startswith("➕"):
                     if c not in df_status.columns:
                         df_status[c] = ""
 
-                # atualiza se já existir (comparação por norm), senão insere
+                # atualiza se já existir, senão insere
                 chave = df_status["Cliente"].astype(str).apply(norm)
                 m = chave == norm(nome_novo)
                 if m.any():
@@ -366,23 +368,22 @@ if acao.startswith("➕"):
                         "Observação": obs_nova.strip()
                     }])], ignore_index=True)
 
-               salvar_df(ABA_STATUS_FEM, df_status)
-st.success(f"Cliente '{nome_novo.strip()}' salvo com sucesso!")
+                salvar_df(ABA_STATUS_FEM, df_status)
+                st.success(f"Cliente '{nome_novo.strip()}' salvo com sucesso!")
 
-# limpa cache e preseleciona o novo cliente
-try:
-    clientes_existentes.clear()
-except Exception:
-    pass
-st.session_state["cliente_recem_cadastrado"] = nome_novo.strip()
+                # limpa cache e preseleciona o novo cliente
+                try:
+                    clientes_existentes.clear()
+                except Exception:
+                    pass
+                st.session_state["cliente_recem_cadastrado"] = nome_novo.strip()
 
-# ✅ Rerun compatível (Streamlit novo/antigo)
-_rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
-if _rerun:
-    _rerun()
-else:
-    st.info("Atualize a página para ver o cliente na lista.")
-
+                # ✅ Rerun compatível (Streamlit novo/antigo)
+                _rerun = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+                if callable(_rerun):
+                    _rerun()
+                else:
+                    st.info("Atualize a página para ver o cliente na lista.")
 
     # Cliente: somente cadastrados (base + status feminino)
     clientes_opts = clientes_existentes()
