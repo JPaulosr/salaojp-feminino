@@ -5,7 +5,6 @@ import streamlit as st
 import pandas as pd
 import gspread
 import hashlib
-import re
 import requests
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
@@ -36,7 +35,7 @@ COLS_DESPESAS_FIX = ["Data","Prestador","Descrição","Valor","Me Pag:"]
 PERCENTUAL_PADRAO = 50.0
 
 # =============================
-# TELEGRAM — helpers no mesmo padrão do 11_Adicionar_Atendimento.py
+# TELEGRAM — helpers (com fallback e diagnóstico)
 # =============================
 def _get_secret(name: str, default: str | None = None) -> str | None:
     try:
@@ -48,25 +47,53 @@ def _get_secret(name: str, default: str | None = None) -> str | None:
         pass
     return (default or "").strip() or None
 
+def _chat_id_jp():
+    # tenta específico e cai pro genérico
+    return _get_secret("TELEGRAM_CHAT_ID_JPAULO") or _get_secret("TELEGRAM_CHAT_ID")
+
+def _chat_id_dani():
+    # tenta específico e cai pro genérico
+    return _get_secret("TELEGRAM_CHAT_ID_DANIELA") or _get_secret("TELEGRAM_CHAT_ID")
+
 def _check_tg_ready(token: str | None, chat_id: str | None) -> bool:
     return bool((token or "").strip() and (chat_id or "").strip())
 
 def tg_send(text: str, chat_id: str | None = None) -> bool:
     token = _get_secret("TELEGRAM_TOKEN")
-    chat = chat_id or _get_secret("TELEGRAM_CHAT_ID_JPAULO")
+    chat = chat_id or _get_secret("TELEGRAM_CHAT_ID")  # fallback final
     if not _check_tg_ready(token, chat):
+        st.warning("⚠️ Telegram não configurado: verifique TELEGRAM_TOKEN e CHAT_ID(s) nos Secrets.")
         return False
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.post(url, json=payload, timeout=30)
-        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-        return bool(r.ok and js.get("ok"))
-    except Exception:
-        return False
+        # Telegram limita a 4096 chars → enviar em partes ≤ 4000
+        chunks = []
+        t = text or ""
+        while t:
+            chunks.append(t[:4000])
+            t = t[4000:]
 
-def _chat_id_jp():   return _get_secret("TELEGRAM_CHAT_ID_JPAULO")
-def _chat_id_dani(): return _get_secret("TELEGRAM_CHAT_ID_DANIELA")
+        ok_total = True
+        for part in chunks:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": chat,
+                "text": part,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }
+            r = requests.post(url, json=payload, timeout=30)
+            js = {}
+            if r.headers.get("content-type", "").startswith("application/json"):
+                js = r.json()
+            if not (r.ok and js.get("ok")):
+                ok_total = False
+                st.error(f"❌ Falha ao enviar Telegram (HTTP {r.status_code}): {r.text[:300]}")
+        if ok_total:
+            st.toast("✅ Telegram enviado com sucesso.", icon="✅")
+        return ok_total
+    except Exception as e:
+        st.error(f"❌ Erro no envio ao Telegram: {e}")
+        return False
 
 # =============================
 # CONEXÃO SHEETS
@@ -111,13 +138,17 @@ def _read_config()->dict:
     out={}
     for _,r in df.iterrows():
         s=str(r.get("Serviço","")).strip()
-        try: p=float(str(r.get("PercentualPadrao","")).replace(",",".")) 
-        except: p=None
-        if s and p is not None: out[s]=p
+        try:
+            p=float(str(r.get("PercentualPadrao","")).replace(",",".")) 
+        except:
+            p=None
+        if s and p is not None:
+            out[s]=p
     return out
 
 def _write_config(perc_map:dict):
-    if not perc_map: return
+    if not perc_map:
+        return
     df=pd.DataFrame([{"Serviço":k,"PercentualPadrao":float(v)} for k,v in sorted(perc_map.items())])
     _write_df(ABA_CONFIG, df)
 
