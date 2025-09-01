@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 12_Comissoes_Daniela.py — Paga TUDO que ainda não foi pago, arredonda base (sempre), mostra pendências/fiados, envia Telegram
+# 12_Comissoes_Daniela.py — Comissão Daniela (paga TUDO, arredonda base, envia prévia e grava despesas)
 
 import streamlit as st
 import pandas as pd
@@ -9,7 +9,7 @@ import re
 import requests
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from math import ceil
 
@@ -18,10 +18,10 @@ from math import ceil
 # =============================
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 
-ABA_DADOS          = "Base de Dados Feminino"
-ABA_COMISSOES_CACHE= "comissoes_cache_feminino"
-ABA_DESPESAS_FEM   = "Despesas Feminino"          # lança 1 linha por DIA
-ABA_CONFIG         = "config_comissoes_feminino"  # persiste % por serviço
+ABA_DADOS            = "Base de Dados Feminino"
+ABA_COMISSOES_CACHE  = "comissoes_cache_feminino"
+ABA_DESPESAS_SALAO   = "Despesas do Salão Feminino"   # << nova aba-alvo p/ lançar comissão
+ABA_CONFIG           = "config_comissoes_feminino"     # persiste % por serviço
 
 TZ = "America/Sao_Paulo"
 FUNCIONARIA = "Daniela"
@@ -102,6 +102,12 @@ def to_br_date(dt:datetime): return dt.strftime("%d/%m/%Y")
 def competencia_from_data_str(s:str):
     dt=parse_br_date(s);  return dt.strftime("%m/%Y") if dt else ""
 def s_lower(s): return s.astype(str).str.strip().str.lower()
+def garantir_colunas(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df
 def make_refid(row:pd.Series)->str:
     key="|".join([
         str(row.get("Cliente","")).strip(),
@@ -188,10 +194,6 @@ if ja_pagos:
 
 st.info("Modo: pagando <b>TUDO</b> que ainda não foi pago — Não fiado + Fiados com DataPagamento ≤ hoje.", icon="💸")
 
-# ====== State para edições do usuário (valor e %) ======
-if "perc_overrides" not in st.session_state:   st.session_state.perc_overrides={}
-if "valor_overrides" not in st.session_state:  st.session_state.valor_overrides={}
-
 # ====== Monta valor base arredondado ======
 def montar_valor_base(df:pd.DataFrame)->pd.DataFrame:
     if df.empty:
@@ -216,27 +218,16 @@ def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
 
     df=df.copy()
 
-    # constrói a visão usando overrides do usuário (se houver)
-    rows=[]
-    for _,r in df.iterrows():
-        ref=r["RefID"]
-        val_base = float(st.session_state.valor_overrides.get(ref, r["Valor_base_comissao"]))
-        perc = float(st.session_state.perc_overrides.get(ref, PERC_SALVOS.get(str(r["Serviço"]).strip(), perc_padrao)))
-        rows.append({
-            "Data": r["Data"],
-            "Cliente": r["Cliente"],
-            "Serviço": r["Serviço"],
-            "Conta": r["Conta"],
-            "Valor (para comissão)": val_base,
-            "% Comissão": perc,
-            "Comissão (R$)": round(val_base*perc/100.0, 2),
-            "Competência": r["Competência"],
-            "RefID": ref
-        })
-
-    ed = pd.DataFrame(rows)
-    st.subheader(titulo)
-    st.caption("Edite o % ou o valor-base (o sistema arredonda para múltiplo de 5 e recalcule automaticamente).")
+    # monta visão inicial usando % salvos
+    ed = df[["Data","Cliente","Serviço","Conta","Valor_base_comissao","Competência","RefID"]].rename(
+        columns={"Valor_base_comissao":"Valor (para comissão)"}
+    )
+    ed["% Comissão"] = ed["Serviço"].apply(lambda s: float(PERC_SALVOS.get(str(s).strip(), perc_padrao)))
+    ed["Comissão (R$)"] = (
+        pd.to_numeric(ed["Valor (para comissão)"], errors="coerce").fillna(0.0) *
+        pd.to_numeric(ed["% Comissão"], errors="coerce").fillna(0.0) / 100.0
+    ).round(2)
+    ed = ed.reset_index(drop=True)
 
     edited = st.data_editor(
         ed,
@@ -250,7 +241,7 @@ def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
         use_container_width=True
     )
 
-    # aplica arredondamento e recalcula; salva overrides por RefID
+    # arredonda valor digitado e recalcula
     edited = edited.copy()
     edited["Valor (para comissão)"] = edited["Valor (para comissão)"].apply(
         lambda x: arredonda_para_cima_mult5(float(pd.to_numeric(x, errors="coerce") or 0.0))
@@ -258,15 +249,11 @@ def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
     edited["% Comissão"] = pd.to_numeric(edited["% Comissão"], errors="coerce").fillna(0.0)
     edited["Comissão (R$)"] = (edited["Valor (para comissão)"] * edited["% Comissão"] / 100.0).round(2)
 
-    for _,r in edited.iterrows():
-        st.session_state.valor_overrides[r["RefID"]] = float(r["Valor (para comissão)"])
-        st.session_state.perc_overrides[r["RefID"]]  = float(r["% Comissão"])
-
     total=float(edited["Comissão (R$)"].sum())
 
     # merged para salvar/telegram
     merged = df.merge(
-        edited[["RefID","Valor (para comissão)","% Comissão","Comissão (R$)","Competência"]],
+        edited[["RefID","Valor (para comissão)","% Comissão","Comissão (R$)","Competência","Data","Cliente","Serviço","Conta"]],
         on="RefID", how="left"
     )
     merged["ValorBaseEditado"]=pd.to_numeric(merged["Valor (para comissão)"], errors="coerce").fillna(0.0)
@@ -285,17 +272,16 @@ if fiado_pend.empty:
     st.info("Nenhum fiado pendente no momento.")
     total_fiados_pend = 0.0
 else:
-    vis = fiado_pend[["Data","Cliente","Serviço","Conta","Valor","Valor_base_comissao","Competência"]].rename(
+    visp = fiado_pend[["Data","Cliente","Serviço","Conta","Valor","Valor_base_comissao","Competência"]].rename(
         columns={"Valor_base_comissao":"Valor (para comissão)"}
     )
-    # usa % salvo por serviço (ou padrão) apenas para mostrar a comissão futura
-    vis["% Comissão"] = vis["Serviço"].apply(lambda s: float(PERC_SALVOS.get(str(s).strip(), perc_padrao)))
-    vis["Comissão (R$)"] = (
-        pd.to_numeric(vis["Valor (para comissão)"], errors="coerce").fillna(0.0) *
-        pd.to_numeric(vis["% Comissão"], errors="coerce").fillna(0.0) / 100.0
+    visp["% Comissão"] = visp["Serviço"].apply(lambda s: float(PERC_SALVOS.get(str(s).strip(), perc_padrao)))
+    visp["Comissão (R$)"] = (
+        pd.to_numeric(visp["Valor (para comissão)"], errors="coerce").fillna(0.0) *
+        pd.to_numeric(visp["% Comissão"], errors="coerce").fillna(0.0) / 100.0
     ).round(2)
-    total_fiados_pend = float(vis["Comissão (R$)"].sum())
-    st.dataframe(vis.sort_values(by=["Data","Cliente"]).reset_index(drop=True), use_container_width=True)
+    total_fiados_pend = float(visp["Comissão (R$)"].sum())
+    st.dataframe(visp.sort_values(by=["Data","Cliente"]).reset_index(drop=True), use_container_width=True)
 st.warning(f"Comissão futura (quando pagarem): **{format_brl(total_fiados_pend)}**")
 
 # ====== Resumo
@@ -304,6 +290,53 @@ with col_m1: st.metric("Não fiado (a pagar)", format_brl(total_nao_fiado))
 with col_m2: st.metric("Fiados liberados (a pagar)", format_brl(total_fiado))
 with col_m3: st.metric("Total desta execução", format_brl(total_nao_fiado+total_fiado))
 with col_m4: st.metric("Fiados pendentes (futuro)", format_brl(total_fiados_pend))
+
+# ====== Builder de mensagem (reuso)
+def _tg_build_msg(titulo: str, vis_df: pd.DataFrame) -> str:
+    if vis_df is None or vis_df.empty:
+        return ""
+    linhas = []
+    for _, r in vis_df.iterrows():
+        dt    = str(r.get("Data","")).strip()
+        cli   = str(r.get("Cliente","")).strip()
+        srv   = str(r.get("Serviço","")).strip()
+        conta = str(r.get("Conta","")).strip()
+        comi  = float(pd.to_numeric(r.get("Comissão (R$)","0"), errors="coerce") or 0.0)
+        linhas.append(f"• {dt} | {cli} — {srv} | <i>{conta}</i>\n   Comissão: <b>{format_brl(comi)}</b>")
+    subtotal = float(pd.to_numeric(vis_df["Comissão (R$)"], errors="coerce").fillna(0.0).sum())
+    return f"<b>{titulo}</b>\n" + "\n".join(linhas) + f"\n<b>Subtotal:</b> {format_brl(subtotal)}\n"
+
+def _tg_build_full(vis_nao_fiado: pd.DataFrame, vis_fiado: pd.DataFrame) -> tuple[str,float]:
+    hoje_str = to_br_date(br_now())
+    tot = float(
+        (vis_nao_fiado["Comissão (R$)"].sum() if vis_nao_fiado is not None and not vis_nao_fiado.empty else 0.0) +
+        (vis_fiado["Comissão (R$)"].sum()     if vis_fiado     is not None and not vis_fiado.empty     else 0.0)
+    )
+    msg  = f"<b>Comissão — {FUNCIONARIA}</b>\nData: {hoje_str}\n\n"
+    msg += _tg_build_msg("Não fiado (pagos agora)", vis_nao_fiado)
+    if msg and not msg.endswith("\n"): msg += "\n"
+    msg += _tg_build_msg("Fiados liberados (pagos agora)", vis_fiado)
+    msg += "\n<b>Total geral desta execução:</b> " + format_brl(tot)
+    return msg, tot
+
+# ====== Botões de PRÉVIA (sem gravar)
+colb1, colb2 = st.columns(2)
+with colb1:
+    if st.button("📤 Enviar resumo (sem gravar)"):
+        msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
+        if TELEGRAM_TOKEN:
+            if notificar_jpaulo and CHAT_ID_JPAULO:  send_telegram(CHAT_ID_JPAULO, msg)
+            if notificar_daniela and CHAT_ID_DANIELA:send_telegram(CHAT_ID_DANIELA, msg)
+        st.success(f"Resumo enviado por Telegram. Total (prévia): {format_brl(tot)}")
+
+with colb2:
+    if st.button("🟢 WhatsApp (prévia) → enviar no Telegram"):
+        # mesmo envio da prévia; só muda a etiqueta do botão (estilo WhatsApp)
+        msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
+        if TELEGRAM_TOKEN:
+            if notificar_jpaulo and CHAT_ID_JPAULO:  send_telegram(CHAT_ID_JPAULO, msg)
+            if notificar_daniela and CHAT_ID_DANIELA:send_telegram(CHAT_ID_DANIELA, msg)
+        st.success(f"Prévia enviada (estilo Whats) no Telegram. Total: {format_brl(tot)}")
 
 # =============================
 # CONFIRMAR E GRAVAR
@@ -314,7 +347,7 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
     else:
         hoje_str=to_br_date(br_now())
 
-        # 1) Atualiza cache
+        # 1) Atualiza cache (anti-duplicidade)
         novos_cache=[]
         for df_part in [grid_nao_fiado, grid_fiado]:
             if df_part is None or df_part.empty: continue
@@ -333,8 +366,8 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
         cache_upd=pd.concat([cache_df[cache_cols], pd.DataFrame(novos_cache)], ignore_index=True)
         _write_df(ABA_COMISSOES_CACHE, cache_upd)
 
-        # 2) Despesas Feminino (1 linha por DIA do atendimento)
-        despesas_df=_read_df(ABA_DESPESAS_FEM)
+        # 2) Despesas do Salão Feminino (1 linha por DIA do atendimento)
+        despesas_df=_read_df(ABA_DESPESAS_SALAO)
         despesas_df=garantir_colunas(despesas_df, COLS_DESPESAS_FIX)
         for c in COLS_DESPESAS_FIX:
             if c not in despesas_df.columns: despesas_df[c]=""
@@ -376,7 +409,7 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
             colunas_finais=[c for c in COLS_DESPESAS_FIX if c in despesas_final.columns] + \
                            [c for c in despesas_final.columns if c not in COLS_DESPESAS_FIX]
             despesas_final=despesas_final[colunas_finais]
-            _write_df(ABA_DESPESAS_FEM, despesas_final)
+            _write_df(ABA_DESPESAS_SALAO, despesas_final)
             linhas_adicionadas=len(linhas)
 
         # 3) Persiste últimos % por serviço
@@ -394,36 +427,14 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
             perc_atualizados.update(m)
         _write_config(perc_atualizados)
 
-        # 4) Telegram — duas cópias (JPaulo e Daniela)
-        def build_msg(titulo, vis_df:pd.DataFrame)->str:
-            if vis_df is None or vis_df.empty: return ""
-            linhas=[]
-            for _,r in vis_df.iterrows():
-                dt=str(r.get("Data","")).strip()
-                cli=str(r.get("Cliente","")).strip()
-                srv=str(r.get("Serviço","")).strip()
-                conta=str(r.get("Conta","")).strip()
-                comi=float(pd.to_numeric(r.get("Comissão (R$)","0"), errors="coerce") or 0.0)
-                linhas.append(f"• {dt} | {cli} — {srv} | <i>{conta}</i>\n   Comissão: <b>{format_brl(comi)}</b>")
-            subtotal=float(pd.to_numeric(vis_df["Comissão (R$)"], errors="coerce").fillna(0.0).sum())
-            return f"<b>{titulo}</b>\n" + "\n".join(linhas) + f"\n<b>Subtotal:</b> {format_brl(subtotal)}\n"
-
-        total_exec=float((vis_nao_fiado["Comissão (R$)"].sum() if not vis_nao_fiado.empty else 0.0) +
-                         (vis_fiado["Comissão (R$)"].sum()     if not vis_fiado.empty     else 0.0))
-
-        msg  = f"<b>Comissão — {FUNCIONARIA}</b>\nData: {to_br_date(br_now())}\n\n"
-        msg += build_msg("Não fiado (pagos agora)", vis_nao_fiado)
-        msg += ("\n" if msg and not msg.endswith("\n") else "")
-        msg += build_msg("Fiados liberados (pagos agora)", vis_fiado)
-        msg += "\n<b>Total geral desta execução:</b> " + format_brl(total_exec)
-
+        # 4) Telegram final (mesma mensagem da prévia)
+        msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
         if TELEGRAM_TOKEN:
             if notificar_jpaulo and CHAT_ID_JPAULO:  send_telegram(CHAT_ID_JPAULO, msg)
             if notificar_daniela and CHAT_ID_DANIELA:send_telegram(CHAT_ID_DANIELA, msg)
 
         st.success(
-            f"🎉 Comissão registrada! {linhas_adicionadas} linha(s) em **{ABA_DESPESAS_FEM}** "
-            f"e {len(novos_cache)} item(ns) no **{ABA_COMISSOES_CACHE}**. "
-            f"Total desta execução: {format_brl(total_exec)}"
+            f"🎉 Comissão registrada! {linhas_adicionadas} linha(s) em **{ABA_DESPESAS_SALAO}** "
+            f"e {len(novos_cache)} item(ns) no **{ABA_COMISSOES_CACHE}**. Total: {format_brl(tot)}"
         )
         st.balloons()
