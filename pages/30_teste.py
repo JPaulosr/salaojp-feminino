@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 12_Comissoes_Daniela.py — Comissão Daniela (paga TUDO, arredonda base, envia prévia e grava despesas)
+# 12_Comissoes_Daniela.py — Comissão Daniela (paga TUDO, arredonda base, envia prévia no Telegram e grava em Despesas do Salão Feminino)
 
 import streamlit as st
 import pandas as pd
@@ -20,7 +20,7 @@ SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 
 ABA_DADOS            = "Base de Dados Feminino"
 ABA_COMISSOES_CACHE  = "comissoes_cache_feminino"
-ABA_DESPESAS_SALAO   = "Despesas do Salão Feminino"   # << nova aba-alvo p/ lançar comissão
+ABA_DESPESAS_SALAO   = "Despesas do Salão Feminino"   # alvo de lançamento
 ABA_CONFIG           = "config_comissoes_feminino"     # persiste % por serviço
 
 TZ = "America/Sao_Paulo"
@@ -34,6 +34,39 @@ COLS_OFICIAIS = [
 COLS_DESPESAS_FIX = ["Data","Prestador","Descrição","Valor","Me Pag:"]
 
 PERCENTUAL_PADRAO = 50.0
+
+# =============================
+# TELEGRAM — helpers no mesmo padrão do 11_Adicionar_Atendimento.py
+# =============================
+def _get_secret(name: str, default: str | None = None) -> str | None:
+    try:
+        val = st.secrets.get(name)
+        val = (val or "").strip()
+        if val:
+            return val
+    except Exception:
+        pass
+    return (default or "").strip() or None
+
+def _check_tg_ready(token: str | None, chat_id: str | None) -> bool:
+    return bool((token or "").strip() and (chat_id or "").strip())
+
+def tg_send(text: str, chat_id: str | None = None) -> bool:
+    token = _get_secret("TELEGRAM_TOKEN")
+    chat = chat_id or _get_secret("TELEGRAM_CHAT_ID_JPAULO")
+    if not _check_tg_ready(token, chat):
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=30)
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+        return bool(r.ok and js.get("ok"))
+    except Exception:
+        return False
+
+def _chat_id_jp():   return _get_secret("TELEGRAM_CHAT_ID_JPAULO")
+def _chat_id_dani(): return _get_secret("TELEGRAM_CHAT_ID_DANIELA")
 
 # =============================
 # CONEXÃO SHEETS
@@ -126,22 +159,6 @@ def format_brl(v:float)->str:
     return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
 # =============================
-# TELEGRAM
-# =============================
-TELEGRAM_TOKEN      = st.secrets.get("TELEGRAM_TOKEN","").strip()
-CHAT_ID_JPAULO      = st.secrets.get("TELEGRAM_CHAT_ID_JPAULO","").strip()
-CHAT_ID_DANIELA     = st.secrets.get("TELEGRAM_CHAT_ID_DANIELA","").strip()
-
-def send_telegram(chat_id:str, text:str):
-    if not TELEGRAM_TOKEN or not chat_id: return
-    try:
-        url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload={"chat_id":chat_id,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
-        requests.post(url, data=payload, timeout=15)
-    except Exception as e:
-        st.warning(f"Falha ao enviar Telegram: {e}")
-
-# =============================
 # UI
 # =============================
 st.set_page_config(layout="wide")
@@ -217,8 +234,6 @@ def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
         return pd.DataFrame(), 0.0, pd.DataFrame()
 
     df=df.copy()
-
-    # monta visão inicial usando % salvos
     ed = df[["Data","Cliente","Serviço","Conta","Valor_base_comissao","Competência","RefID"]].rename(
         columns={"Valor_base_comissao":"Valor (para comissão)"}
     )
@@ -251,7 +266,6 @@ def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
 
     total=float(edited["Comissão (R$)"].sum())
 
-    # merged para salvar/telegram
     merged = df.merge(
         edited[["RefID","Valor (para comissão)","% Comissão","Comissão (R$)","Competência","Data","Cliente","Serviço","Conta"]],
         on="RefID", how="left"
@@ -266,7 +280,7 @@ def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
 grid_nao_fiado, total_nao_fiado, vis_nao_fiado = preparar_grid(nao_fiado, "Não fiado (a pagar)", "nao_fiado")
 grid_fiado,     total_fiado,     vis_fiado     = preparar_grid(fiado_lib,  "Fiados liberados (a pagar)", "fiado_lib")
 
-# ====== Bloco sempre visível — Fiados pendentes (histórico, ainda NÃO pagos) ======
+# ====== Fiados pendentes (sempre visível)
 st.subheader("📌 Fiados pendentes (histórico — ainda NÃO pagos)")
 if fiado_pend.empty:
     st.info("Nenhum fiado pendente no momento.")
@@ -319,24 +333,12 @@ def _tg_build_full(vis_nao_fiado: pd.DataFrame, vis_fiado: pd.DataFrame) -> tupl
     msg += "\n<b>Total geral desta execução:</b> " + format_brl(tot)
     return msg, tot
 
-# ====== Botões de PRÉVIA (sem gravar)
-colb1, colb2 = st.columns(2)
-with colb1:
-    if st.button("📤 Enviar resumo (sem gravar)"):
-        msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
-        if TELEGRAM_TOKEN:
-            if notificar_jpaulo and CHAT_ID_JPAULO:  send_telegram(CHAT_ID_JPAULO, msg)
-            if notificar_daniela and CHAT_ID_DANIELA:send_telegram(CHAT_ID_DANIELA, msg)
-        st.success(f"Resumo enviado por Telegram. Total (prévia): {format_brl(tot)}")
-
-with colb2:
-    if st.button("🟢 WhatsApp (prévia) → enviar no Telegram"):
-        # mesmo envio da prévia; só muda a etiqueta do botão (estilo WhatsApp)
-        msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
-        if TELEGRAM_TOKEN:
-            if notificar_jpaulo and CHAT_ID_JPAULO:  send_telegram(CHAT_ID_JPAULO, msg)
-            if notificar_daniela and CHAT_ID_DANIELA:send_telegram(CHAT_ID_DANIELA, msg)
-        st.success(f"Prévia enviada (estilo Whats) no Telegram. Total: {format_brl(tot)}")
+# ====== Botão de PRÉVIA (sem gravar) — somente Telegram
+if st.button("📤 Enviar resumo (sem gravar) — Telegram"):
+    msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
+    if notificar_jpaulo and _chat_id_jp():   tg_send(msg, chat_id=_chat_id_jp())
+    if notificar_daniela and _chat_id_dani():tg_send(msg, chat_id=_chat_id_dani())
+    st.success(f"Resumo enviado por Telegram. Total (prévia): {format_brl(tot)}")
 
 # =============================
 # CONFIRMAR E GRAVAR
@@ -429,9 +431,8 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
 
         # 4) Telegram final (mesma mensagem da prévia)
         msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
-        if TELEGRAM_TOKEN:
-            if notificar_jpaulo and CHAT_ID_JPAULO:  send_telegram(CHAT_ID_JPAULO, msg)
-            if notificar_daniela and CHAT_ID_DANIELA:send_telegram(CHAT_ID_DANIELA, msg)
+        if notificar_jpaulo and _chat_id_jp():   tg_send(msg, chat_id=_chat_id_jp())
+        if notificar_daniela and _chat_id_dani():tg_send(msg, chat_id=_chat_id_dani())
 
         st.success(
             f"🎉 Comissão registrada! {linhas_adicionadas} linha(s) em **{ABA_DESPESAS_SALAO}** "
