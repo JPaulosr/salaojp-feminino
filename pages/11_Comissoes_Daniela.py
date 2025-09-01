@@ -9,7 +9,8 @@ import re
 import requests
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 import pytz
 from math import ceil
 
@@ -150,8 +151,10 @@ def parse_br_date(s:str):
         except: pass
     return None
 def to_br_date(dt:datetime): return dt.strftime("%d/%m/%Y")
+def competencia_from_date(dt:datetime|None):
+    return dt.strftime("%m/%Y") if dt else ""
 def competencia_from_data_str(s:str):
-    dt=parse_br_date(s);  return dt.strftime("%m/%Y") if dt else ""
+    return competencia_from_date(parse_br_date(s))
 def s_lower(s): return s.astype(str).str.strip().str.lower()
 def garantir_colunas(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     df = df.copy()
@@ -176,11 +179,21 @@ def arredonda_para_cima_mult5(v:float)->float:
 def format_brl(v:float)->str:
     return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
+def last_day_of_month_from_comp(comp_str: str) -> str:
+    """Recebe 'mm/AAAA' e retorna 'DD/mm/AAAA' com o último dia daquele mês."""
+    comp_str = (comp_str or "").strip()
+    if not re.match(r"^\d{2}/\d{4}$", comp_str):
+        return to_br_date(br_now())  # fallback: hoje
+    m, y = comp_str.split("/")
+    y = int(y); m = int(m)
+    last_day = calendar.monthrange(y, m)[1]
+    return f"{last_day:02d}/{m:02d}/{y}"
+
 # =============================
 # UI
 # =============================
 st.set_page_config(layout="wide")
-st.title(f"💇‍♀️ Comissão — {FUNCIONARIA} (paga TUDO; arredonda base em múltiplos de 5)")
+st.title(f"💇‍♀️ Comissão — {FUNCIONARIA} (paga TUDO; arredonda base; lança em Despesas do Salão Feminino)")
 
 base=_read_df(ABA_DADOS)
 base=garantir_colunas(base, COLS_OFICIAIS).copy()
@@ -196,9 +209,10 @@ with colC:
 
 descricao_padrao=st.text_input("Descrição (para DESPESAS)", value=f"Comissão {FUNCIONARIA}")
 
-colN1, colN2 = st.columns(2)
+colN1, colN2, colN3 = st.columns(3)
 with colN1: notificar_jpaulo  = st.checkbox("Enviar Telegram para JPaulo",  value=True)
 with colN2: notificar_daniela = st.checkbox("Enviar Telegram para Daniela", value=True)
+with colN3: salvar_no_cache   = st.checkbox("Gravar histórico no comissoes_cache_feminino?", value=False)
 
 # ====== Seleção de dados (PAGA TUDO) ======
 dfv=base[s_lower(base["Funcionário"])==FUNCIONARIA.lower()].copy()
@@ -232,12 +246,22 @@ st.info("Modo: pagando <b>TUDO</b> que ainda não foi pago — Não fiado + Fiad
 # ====== Monta valor base arredondado ======
 def montar_valor_base(df:pd.DataFrame)->pd.DataFrame:
     if df.empty:
-        df["Valor_num"]=[]; df["Competência"]=[]; df["Valor_base_comissao"]=[]
+        df["Valor_num"]=[]; df["Competência"]=[]; df["Valor_base_comissao"]=[]; df["CompetênciaPagto"]=[]
         return df
     df=df.copy()
     df["Valor_num"]=pd.to_numeric(df["Valor"], errors="coerce").fillna(0.0)
     df["Competência"]=df["Data"].apply(competencia_from_data_str)
     df["Valor_base_comissao"]=df["Valor_num"].apply(arredonda_para_cima_mult5)
+    # Competência para lançamento da DESPESA:
+    # - Não fiado: usa mês de Data (atendimento)
+    # - Fiado liberado: usa mês de DataPagamento
+    if "DataPagamento" in df.columns:
+        df["CompetênciaPagto"] = df.apply(
+            lambda r: competencia_from_data_str(r.get("DataPagamento")) if str(r.get("DataPagamento","")).strip() else competencia_from_data_str(r.get("Data","")),
+            axis=1
+        )
+    else:
+        df["CompetênciaPagto"] = df["Competência"]
     return df
 
 nao_fiado = montar_valor_base(nao_fiado)
@@ -340,12 +364,13 @@ def _tg_build_msg(titulo: str, vis_df: pd.DataFrame) -> str:
             df[col] = ""
 
     # agrupa por (Data, Cliente, Conta)
+    perc_col = "% Comissão" if "% Comissão" in df.columns else " % Comissão"
     agg = (
         df.groupby(["Data", "Cliente", "Conta"], dropna=False)
           .agg(
               servicos=("Serviço", lambda s: " + ".join([str(x).strip() for x in s if str(x).strip()])),
               comissao=("Comissão (R$)", "sum"),
-              perc=(" % Comissão" if " % Comissão" in df.columns else "% Comissão", "mean")
+              perc=(perc_col, "mean")
           )
           .reset_index()
           .sort_values(["Data", "Cliente"])
@@ -373,7 +398,7 @@ def _tg_build_full(vis_nao_fiado: pd.DataFrame, vis_fiado: pd.DataFrame) -> tupl
         (vis_nao_fiado["Comissão (R$)"].sum() if vis_nao_fiado is not None and not vis_nao_fiado.empty else 0.0) +
         (vis_fiado["Comissão (R$)"].sum()     if vis_fiado     is not None and not vis_fiado.empty     else 0.0)
     )
-    msg  = f"<b>Comissão — {FUNCIONARIA}</b>\nData: {hoje_str}\n\n"
+    msg  = f"<b>Comissão — {FUNCIONARIA}</b>\nData de processamento: {hoje_str}\n\n"
     msg += _tg_build_msg("Não fiado (pagos agora)", vis_nao_fiado)
     if msg and not msg.endswith("\n"): msg += "\n"
     msg += _tg_build_msg("Fiados liberados (pagos agora)", vis_fiado)
@@ -390,70 +415,72 @@ if st.button("📤 Enviar resumo (sem gravar) — Telegram"):
 # =============================
 # CONFIRMAR E GRAVAR
 # =============================
-if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e enviar Telegram"):
+if st.button("✅ Registrar comissão (1 linha por MÊS/Competência), lançar em DESPESAS e enviar Telegram"):
     if (grid_nao_fiado is None or grid_nao_fiado.empty) and (grid_fiado is None or grid_fiado.empty):
         st.warning("Não há itens para pagar.")
     else:
         hoje_str=to_br_date(br_now())
 
-        # 1) Atualiza cache (anti-duplicidade)
-        novos_cache=[]
-        for df_part in [grid_nao_fiado, grid_fiado]:
-            if df_part is None or df_part.empty: continue
-            for _,r in df_part.iterrows():
-                novos_cache.append({
-                    "RefID": r["RefID"],
-                    "Funcionario": FUNCIONARIA,
-                    "PagoEm": hoje_str,
-                    "TerçaPagamento": "",  # sem janela fixa
-                    "ValorComissao": f'{float(r["ComissaoValor"]):.2f}'.replace(".", ","),
-                    "Competencia": r.get("Competência",""),
-                    "Observacao": f'{r.get("Cliente","")} | {r.get("Serviço","")} | {r.get("Data","")}',
-                })
-        cache_df=_read_df(ABA_COMISSOES_CACHE)
-        cache_df=garantir_colunas(cache_df, cache_cols)
-        cache_upd=pd.concat([cache_df[cache_cols], pd.DataFrame(novos_cache)], ignore_index=True)
-        _write_df(ABA_COMISSOES_CACHE, cache_upd)
+        # 0) (Opcional) Atualiza cache (anti-duplicidade) — desativado por padrão
+        if salvar_no_cache:
+            novos_cache=[]
+            for df_part in [grid_nao_fiado, grid_fiado]:
+                if df_part is None or df_part.empty: continue
+                for _,r in df_part.iterrows():
+                    novos_cache.append({
+                        "RefID": r["RefID"],
+                        "Funcionario": FUNCIONARIA,
+                        "PagoEm": hoje_str,
+                        "TerçaPagamento": "",  # sem janela fixa
+                        "ValorComissao": f'{float(r["ComissaoValor"]):.2f}'.replace(".", ","),
+                        "Competencia": r.get("Competência",""),
+                        "Observacao": f'{r.get("Cliente","")} | {r.get("Serviço","")} | {r.get("Data","")}',
+                    })
+            cache_df=_read_df(ABA_COMISSOES_CACHE)
+            cache_df=garantir_colunas(cache_df, ["RefID","Funcionario","PagoEm","TerçaPagamento","ValorComissao","Competencia","Observacao"])
+            cache_upd=pd.concat([cache_df[["RefID","Funcionario","PagoEm","TerçaPagamento","ValorComissao","Competencia","Observacao"]], pd.DataFrame(novos_cache)], ignore_index=True)
+            _write_df(ABA_COMISSOES_CACHE, cache_upd)
 
-        # 2) Despesas do Salão Feminino (1 linha por DIA do atendimento)
+        # 1) DESPESAS DO SALÃO FEMININO (1 linha por MÊS/Competência de pagamento)
         despesas_df=_read_df(ABA_DESPESAS_SALAO)
         despesas_df=garantir_colunas(despesas_df, COLS_DESPESAS_FIX)
-        for c in COLS_DESPESAS_FIX:
-            if c not in despesas_df.columns: despesas_df[c]=""
 
         pagaveis=[]
-        for df_part in [grid_nao_fiado, grid_fiado]:
-            if df_part is None or df_part.empty: continue
-            pagaveis.append(df_part[["Data","Competência","ComissaoValor"]].copy())
+        # Não fiado: competência de DESPESA = mês da Data do atendimento
+        if grid_nao_fiado is not None and not grid_nao_fiado.empty:
+            nf = grid_nao_fiado[["CompetênciaPagto","ComissaoValor"]].copy()
+            nf = nf.rename(columns={"CompetênciaPagto":"CompPagto"})
+            pagaveis.append(nf)
+
+        # Fiado liberado: competência de DESPESA = mês da DataPagamento
+        if grid_fiado is not None and not grid_fiado.empty:
+            fl = grid_fiado[["CompetênciaPagto","ComissaoValor"]].copy()
+            fl = fl.rename(columns={"CompetênciaPagto":"CompPagto"})
+            pagaveis.append(fl)
 
         linhas_adicionadas=0
+        total_lancado = 0.0
         if pagaveis:
             pagos=pd.concat(pagaveis, ignore_index=True)
+            pagos["ComissaoValor"] = pd.to_numeric(pagos["ComissaoValor"], errors="coerce").fillna(0.0)
 
-            def _norm_dt(s):
-                s=(s or "").strip()
-                for fmt in ("%d/%m/%Y","%d-%m-%Y","%Y-%m-%d"):
-                    try: return datetime.strptime(s, fmt)
-                    except: pass
-                return None
-
-            pagos["_dt"]=pagos["Data"].apply(_norm_dt)
-            pagos=pagos[pagos["_dt"].notna()].copy()
-
-            por_dia=pagos.groupby(["Data","Competência"], dropna=False)["ComissaoValor"].sum().reset_index()
+            por_comp = pagos.groupby(["CompPagto"], dropna=False)["ComissaoValor"].sum().reset_index()
 
             linhas=[]
-            for _,row in por_dia.iterrows():
-                data_serv=str(row["Data"]).strip()
-                comp=str(row["Competência"]).strip()
-                val=float(row["ComissaoValor"])
+            for _,row in por_comp.iterrows():
+                comp = str(row["CompPagto"]).strip() or competencia_from_date(br_now())
+                val  = float(row["ComissaoValor"])
+                data_lcto = last_day_of_month_from_comp(comp)   # <-- aqui garantimos o "dia 31" (ou 30/29/28 conforme o mês)
+
                 linhas.append({
-                    "Data": data_serv,
+                    "Data": data_lcto,
                     "Prestador": FUNCIONARIA,
-                    "Descrição": f"{descricao_padrao} — Comp {comp} — Pago em {hoje_str}",
+                    "Descrição": f"{descricao_padrao} — Comp {comp} — Processado em {hoje_str}",
                     "Valor": f'R$ {val:.2f}'.replace(".", ","),
                     "Me Pag:": meio_pag
                 })
+                total_lancado += val
+
             despesas_final=pd.concat([despesas_df, pd.DataFrame(linhas)], ignore_index=True)
             colunas_finais=[c for c in COLS_DESPESAS_FIX if c in despesas_final.columns] + \
                            [c for c in despesas_final.columns if c not in COLS_DESPESAS_FIX]
@@ -461,14 +488,15 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
             _write_df(ABA_DESPESAS_SALAO, despesas_final)
             linhas_adicionadas=len(linhas)
 
-        # 3) Persiste últimos % por serviço
+        # 2) Persiste últimos % por serviço
         perc_atualizados=dict(PERC_SALVOS)
         def _coleta_percentuais(vis_df):
             out={}
             if vis_df is None or vis_df.empty: return out
+            col = "% Comissão" if "% Comissão" in vis_df.columns else " % Comissão"
             for _,r in vis_df.iterrows():
                 s=str(r.get("Serviço","")).strip()
-                try: p=float(str(r.get("% Comissão","")).replace(",", "."))
+                try: p=float(str(r.get(col,"")).replace(",", "."))
                 except: p=None
                 if s and p is not None: out[s]=p
             return out
@@ -476,13 +504,14 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
             perc_atualizados.update(m)
         _write_config(perc_atualizados)
 
-        # 4) Telegram final (mesma mensagem da prévia)
+        # 3) Telegram final (mesma mensagem da prévia)
         msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
         if notificar_jpaulo and _get_chat_id_jp():    tg_send(msg, chat_id=_get_chat_id_jp())
         if notificar_daniela and _get_chat_id_dani(): tg_send(msg, chat_id=_get_chat_id_dani())
 
         st.success(
-            f"🎉 Comissão registrada! {linhas_adicionadas} linha(s) em **{ABA_DESPESAS_SALAO}** "
-            f"e {len(novos_cache)} item(ns) no **{ABA_COMISSOES_CACHE}**. Total: {format_brl(tot)}"
+            f"🎉 Comissão registrada! {linhas_adicionadas} linha(s) em **{ABA_DESPESAS_SALAO}** (1 por competência, Data = último dia do mês). "
+            f"Total lançado: {format_brl(total_lancado)}"
+            + ("" if not salvar_no_cache else " | Histórico atualizado em comissoes_cache_feminino.")
         )
         st.balloons()
