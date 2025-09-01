@@ -1,5 +1,4 @@
-# 11_Adicionar_Atendimento.py — FEMININO (com % Daniela e canais atualizados)
-# -*- coding: utf-8 -*-
+# 11_Adicionar_Atendimento.py — VERSÃO FEMININO COMPLETA (atualizada)
 import streamlit as st
 import pandas as pd
 import gspread
@@ -16,314 +15,152 @@ from collections import Counter
 # CONFIG
 # =========================
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
+
+# >>> Abas FEMININO <<<
 ABA_DADOS = "Base de Dados Feminino"
 STATUS_ABA = "clientes_status_feminino"
 
-FOTO_COL_CANDIDATES = ["link_foto","foto","imagem","url_foto","foto_link","link","image"]
+FOTO_COL_CANDIDATES = ["link_foto", "foto", "imagem", "url_foto", "foto_link", "link", "image"]
 
 TZ = "America/Sao_Paulo"
 REL_MULT = 1.5
 DATA_FMT = "%d/%m/%Y"
 
-COLS_OFICIAIS = ["Data","Serviço","Valor","Conta","Cliente","Combo",
-                 "Funcionário","Fase","Tipo","Período"]
-COLS_FIADO = ["StatusFiado","IDLancFiado","VencimentoFiado","DataPagamento"]
-COLS_PAG_EXTRAS = ["ValorBrutoRecebido","ValorLiquidoRecebido","TaxaCartaoValor","TaxaCartaoPct",
-                   "FormaPagDetalhe","PagamentoID"]
+COLS_OFICIAIS = [
+    "Data", "Serviço", "Valor", "Conta", "Cliente", "Combo",
+    "Funcionário", "Fase", "Tipo", "Período"
+]
+COLS_FIADO = ["StatusFiado", "IDLancFiado", "VencimentoFiado", "DataPagamento"]
 
-# Funcionárias FEM
-FUNCIONARIOS_FEM = ["Daniela","Meire"]
+# Extras para pagamento com cartão
+COLS_PAG_EXTRAS = [
+    "ValorBrutoRecebido", "ValorLiquidoRecebido",
+    "TaxaCartaoValor", "TaxaCartaoPct",
+    "FormaPagDetalhe", "PagamentoID"
+]
+
+FUNCIONARIOS_FEM = ["Daniela", "Meire"]
 
 # =========================
-# TELEGRAM (preencha se mudar)
+# TELEGRAM IDs
 # =========================
 TELEGRAM_TOKEN = "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE"
-TELEGRAM_CHAT_ID_JPAULO   = "493747253"
+TELEGRAM_CHAT_ID_JPAULO = "493747253"
 TELEGRAM_CHAT_ID_VINICIUS = "-1001234567890"
-TELEGRAM_CHAT_ID_FEMININO = "-1002965378062"   # Canal Feminino (Meire)
-TELEGRAM_CHAT_ID_DANIELA  = "-1003039502089"   # Canal Daniela
-
-def _get_secret(name, default=None):
-    try:
-        v = (st.secrets.get(name) or "").strip()
-        if v: return v
-    except Exception:
-        pass
-    return (default or "").strip() or None
-
-def _get_token():         return _get_secret("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
-def _get_chat_id_jp():    return _get_secret("TELEGRAM_CHAT_ID_JPAULO", TELEGRAM_CHAT_ID_JPAULO)
-def _get_chat_id_vini():  return _get_secret("TELEGRAM_CHAT_ID_VINICIUS", TELEGRAM_CHAT_ID_VINICIUS)
-def _get_chat_id_fem():   return _get_secret("TELEGRAM_CHAT_ID_FEMININO", TELEGRAM_CHAT_ID_FEMININO)
-def _get_chat_id_dan():   return _get_secret("TELEGRAM_CHAT_ID_DANIELA", TELEGRAM_CHAT_ID_DANIELA)
-
-def _check_tg_ready(token, chat_id): return bool((token or "").strip() and (chat_id or "").strip())
+TELEGRAM_CHAT_ID_FEMININO = "-1002965378062"
+TELEGRAM_CHAT_ID_DANIELA = "-1003039502089"
 
 # =========================
 # UTILS
 # =========================
-def _norm(s): s=(s or "").strip().casefold(); s=unicodedata.normalize("NFD", s); return "".join(ch for ch in s if unicodedata.category(ch)!="Mn")
-def _norm_key(s): return unicodedata.normalize("NFKC", str(s).strip()).casefold()
-def _cap_first(s): return (str(s).strip().lower().capitalize()) if s is not None else ""
-def now_br(): return datetime.now(pytz.timezone(TZ)).strftime("%d/%m/%Y %H:%M:%S")
+def _norm(s: str) -> str:
+    s = (s or "").strip().casefold()
+    s = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
-def contains_cartao(s):
-    MAQ={"cart","cartao","cartão","credito","crédito","debito","débito","maquina","maquininha","maquineta","pos",
-         "pagseguro","mercadopago","mercado pago","sumup","stone","cielo","rede","getnet","safra",
-         "visa","master","elo","hiper","amex","nubank","nubank cnpj"}
-    x=unicodedata.normalize("NFKD",(s or "")).encode("ascii","ignore").decode("ascii").lower().replace(" ","")
-    return any(k in x for k in MAQ)
-
-def is_nao_cartao(conta):
-    s=unicodedata.normalize("NFKD",(conta or "")).encode("ascii","ignore").decode("ascii").lower()
-    tokens={"pix","dinheiro","carteira","cash","especie","espécie","transfer","transferencia","transferência","ted","doc"}
-    return any(t in s for t in tokens)
-
-def default_card_flag(conta):
-    if is_nao_cartao(conta): return False
-    return contains_cartao(conta)
+def _fmt_brl(v: float) -> str:
+    try:
+        v = float(v)
+    except Exception:
+        v = 0.0
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def gerar_pag_id(prefixo="A"):
     return f"{prefixo}-{datetime.now(pytz.timezone(TZ)).strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
-def _fmt_brl(v):
-    try: v=float(v)
-    except Exception: v=0.0
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-
-# =========================
-# SHEETS
-# =========================
-@st.cache_resource
-def conectar_sheets():
-    info = st.secrets["GCP_SERVICE_ACCOUNT"]
-    escopo=["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-    cred=Credentials.from_service_account_info(info, scopes=escopo)
-    cli=gspread.authorize(cred)
-    return cli.open_by_key(SHEET_ID)
-
-def ler_cabecalho(aba):
+def _calc_payout_daniela(valor_total: float, pct: float | None) -> str:
+    if pct is None:
+        return ""
     try:
-        headers=aba.row_values(1)
-        return [h.strip() for h in headers] if headers else []
+        pctf = max(0.0, min(100.0, float(pct)))
     except Exception:
-        return []
-
-def _cmap(ws):
-    headers=ler_cabecalho(ws); cmap={}
-    for i,h in enumerate(headers):
-        k=_norm_key(h)
-        if k and k not in cmap: cmap[k]=i+1
-    return cmap
-
-def format_extras_numeric(ws):
-    cmap=_cmap(ws)
-    def fmt(name, ntype, pattern):
-        c=cmap.get(_norm_key(name))
-        if not c: return
-        a1_from=rowcol_to_a1(2,c); a1_to=rowcol_to_a1(50000,c)
-        try: ws.format(f"{a1_from}:{a1_to}", {"numberFormat":{"type":ntype,"pattern":pattern}})
-        except Exception: pass
-    fmt("ValorBrutoRecebido","NUMBER","0.00")
-    fmt("ValorLiquidoRecebido","NUMBER","0.00")
-    fmt("TaxaCartaoValor","NUMBER","0.00")
-    fmt("TaxaCartaoPct","PERCENT","0.00%")
-
-def carregar_base():
-    aba=conectar_sheets().worksheet(ABA_DADOS)
-    df=get_as_dataframe(aba).dropna(how="all")
-    df.columns=[str(c).strip() for c in df.columns]
-    df=df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
-    for c in [*COLS_OFICIAIS,*COLS_FIADO,*COLS_PAG_EXTRAS]:
-        if c not in df.columns: df[c]=""
-    norm={"manha":"Manhã","Manha":"Manhã","manha ":"Manhã","tarde":"Tarde","noite":"Noite"}
-    df["Período"]=df["Período"].astype(str).str.strip().replace(norm)
-    df.loc[~df["Período"].isin(["Manhã","Tarde","Noite"]), "Período"]=""
-    df["Combo"]=df["Combo"].fillna("")
-    return df, aba
-
-def salvar_base(df_final):
-    aba=conectar_sheets().worksheet(ABA_DADOS)
-    headers_exist=ler_cabecalho(aba) or [*COLS_OFICIAIS,*COLS_FIADO,*COLS_PAG_EXTRAS]
-    col_alvo=list(dict.fromkeys([*headers_exist,*COLS_OFICIAIS,*COLS_FIADO,*COLS_PAG_EXTRAS]))
-    for c in col_alvo:
-        if c not in df_final.columns: df_final[c]=""
-    df_final=df_final[col_alvo]
-    aba.clear()
-    set_with_dataframe(aba, df_final, include_index=False, include_column_header=True)
-    try: format_extras_numeric(aba)
-    except Exception: pass
-
-# =========================
-# FOTOS
-# =========================
-@st.cache_data(show_spinner=False)
-def carregar_fotos_mapa():
-    try:
-        sh=conectar_sheets()
-        if STATUS_ABA not in [w.title for w in sh.worksheets()]: return {}
-        ws=sh.worksheet(STATUS_ABA)
-        df=get_as_dataframe(ws).fillna("")
-        df.columns=[str(c).strip() for c in df.columns]
-        df=df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
-        cols_lower={c.lower():c for c in df.columns}
-        foto_col=next((cols_lower[c] for c in FOTO_COL_CANDIDATES if c in cols_lower), None)
-        cli_col=next((cols_lower[c] for c in ["cliente","nome","nome_cliente"] if c in cols_lower), None)
-        if not (foto_col and cli_col): return {}
-        tmp=df[[cli_col,foto_col]].copy(); tmp.columns=["Cliente","Foto"]
-        tmp["k"]=tmp["Cliente"].astype(str).map(_norm)
-        return {r["k"]: str(r["Foto"]).strip() for _,r in tmp.iterrows() if str(r["Foto"]).strip()}
-    except Exception:
-        return {}
-FOTOS=carregar_fotos_mapa()
+        pctf = 0.0
+    valor_receber = round(float(valor_total or 0.0) * (pctf / 100.0), 2)
+    return f"💰 Daniela recebe: <b>{_fmt_brl(valor_receber)}</b> ({pctf:.0f}%)"
 
 # =========================
 # TELEGRAM – envio
 # =========================
-def tg_send(text, chat_id=None):
-    token=_get_token(); chat=chat_id or _get_chat_id_jp()
-    if not _check_tg_ready(token, chat): return False
+def tg_send(text: str, chat_id: str) -> bool:
     try:
-        url=f"https://api.telegram.org/bot{token}/sendMessage"
-        payload={"chat_id":chat,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
-        r=requests.post(url, json=payload, timeout=30)
-        js=r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-        return bool(r.ok and js.get("ok"))
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=30)
+        return r.ok
     except Exception:
         return False
 
-def tg_send_photo(photo_url, caption, chat_id=None):
-    token=_get_token(); chat=chat_id or _get_chat_id_jp()
-    if not _check_tg_ready(token, chat): return False
+def tg_send_photo(photo_url: str, caption: str, chat_id: str) -> bool:
     try:
-        url=f"https://api.telegram.org/bot{token}/sendPhoto"
-        payload={"chat_id":chat,"photo":photo_url,"caption":caption,"parse_mode":"HTML"}
-        r=requests.post(url, data=payload, timeout=30)
-        js=r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-        if r.ok and js.get("ok"): return True
-        return tg_send(caption, chat_id=chat)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        payload = {"chat_id": chat_id, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
+        r = requests.post(url, data=payload, timeout=30)
+        if r.ok: return True
+        return tg_send(caption, chat_id=chat_id)
     except Exception:
-        return tg_send(caption, chat_id=chat)
+        return tg_send(caption, chat_id=chat_id)
 
 # =========================
-# CARD helpers
+# CARDS
 # =========================
-def _resumo_do_dia(df_all, cliente, data_str):
-    d=df_all[(df_all["Cliente"].astype(str).str.strip()==cliente) &
-             (df_all["Data"].astype(str).str.strip()==data_str)].copy()
-    d["Valor"]=pd.to_numeric(d["Valor"],errors="coerce").fillna(0.0)
-    servicos=[str(s).strip() for s in d["Serviço"].fillna("").tolist() if str(s).strip()]
-    valor_total=float(d["Valor"].sum()) if not d.empty else 0.0
-    is_combo=len(servicos)>1 or (d["Combo"].fillna("").str.strip()!="").any()
-    label=" + ".join(servicos)+(" (Combo)" if is_combo else " (Simples)") if servicos else "-"
-    periodo_vals=[p for p in d["Período"].astype(str).str.strip().tolist() if p]
-    periodo_label=max(set(periodo_vals), key=periodo_vals.count) if periodo_vals else "-"
-    return label, valor_total, is_combo, servicos, periodo_label
-
-def _ano_from_date_str(data_str):
-    dt=pd.to_datetime(data_str, format=DATA_FMT, errors="coerce")
-    return None if pd.isna(dt) else int(dt.year)
-
-def _year_sections_for_jpaulo(df_all, cliente, ano):
-    d=df_all.copy()
-    d=d[d["Cliente"].astype(str).str.strip()==cliente].copy()
-    d["_dt"]=pd.to_datetime(d["Data"], format=DATA_FMT, errors="coerce")
-    d=d.dropna(subset=["_dt"]); d["ano"]=d["_dt"].dt.year; d=d[d["ano"]==ano].copy()
-    if d.empty: return (f"📚 <b>Histórico por ano</b>\n{ano}: R$ 0,00", f"🧾 <b>{ano}: por serviço</b>\n—")
-    d["Valor"]=pd.to_numeric(d["Valor"],errors="coerce").fillna(0.0)
-    total_ano=float(d["Valor"].sum())
-    sec_hist="📚 <b>Histórico por ano</b>\n"+f"{ano}: <b>{_fmt_brl(total_ano)}</b>"
-    grp=(d.dropna(subset=["Serviço"]).assign(Serviço=lambda x:x["Serviço"].astype(str).str.strip())
-          .groupby("Serviço",as_index=False).agg(qtd=("Serviço","count"), total=("Valor","sum"))
-          .sort_values(["total","qtd"], ascending=[False,False]))
-    linhas_serv=[f"{r['Serviço']}: <b>{int(r['qtd'])}×</b> • <b>{_fmt_brl(float(r['total']))}</b>" for _,r in grp.iterrows()]
-    sec_serv="🧾 <b>{}: por serviço</b>\n{}".format(ano,"\n".join(linhas_serv) if linhas_serv else "—")
-    return sec_hist, sec_serv
-
-def _secao_pag_cartao(df_all, cliente, data_str):
-    df=df_all[(df_all["Cliente"].astype(str).str.strip()==cliente) &
-              (df_all["Data"].astype(str).str.strip()==data_str)].copy()
-    if df.empty: return ""
-    df["_idx"]=df.index
-    com_pid=df[df["PagamentoID"].astype(str).str.strip()!=""].copy()
-    if com_pid.empty: return ""
-    latest_row=com_pid.loc[com_pid["_idx"].idxmax()]
-    pid=str(latest_row["PagamentoID"]).strip()
-    bloco=df[df["PagamentoID"].astype(str).str.strip()==pid].copy()
-    bruto=pd.to_numeric(bloco.get("ValorBrutoRecebido",0),errors="coerce").fillna(0).sum()
-    liqui=pd.to_numeric(bloco.get("ValorLiquidoRecebido",0),errors="coerce").fillna(0).sum()
-    taxa_v=pd.to_numeric(bloco.get("TaxaCartaoValor",0),errors="coerce").fillna(0).sum()
-    if liqui<=0: liqui=pd.to_numeric(bloco.get("Valor",0),errors="coerce").fillna(0).sum()
-    taxa_pct=(taxa_v/bruto*100.0) if bruto>0 else 0.0
-    det=""
-    if "FormaPagDetalhe" in bloco.columns:
-        s=bloco["FormaPagDetalhe"].astype(str).str.strip(); s=s[s!=""]; det=s.iloc[0] if not s.empty else ""
-    conta=""
-    if "Conta" in bloco.columns:
-        s2=bloco["Conta"].astype(str).str.strip(); s2=s2[s2!=""]; conta=s2.iloc[0] if not s2.empty else ""
-    linhas=["------------------------------",
-            "💳 <b>Pagamento no cartão</b>",
-            f"Forma: <b>{conta or '-'}</b>{(' · '+det) if det else ''}",
-            f"Bruto: <b>{_fmt_brl(bruto)}</b> · Líquido: <b>{_fmt_brl(liqui)}</b>",
-            f"Taxa total: <b>{_fmt_brl(taxa_v)} ({taxa_pct:.2f}%)</b>"]
-    return "\n".join(linhas)
-
 def make_card_caption(df_all, cliente, data_str, funcionario, servico_label, valor_total, periodo_label,
-                      pct_daniela=None, append_sections=None):
-    valor_str=_fmt_brl(valor_total)
-    base=("📌 <b>Atendimento registrado</b>\n"
-          f"👤 Cliente: <b>{cliente}</b>\n"
-          f"🗓️ Data: <b>{data_str}</b>\n"
-          f"🕒 Período: <b>{periodo_label}</b>\n"
-          f"✂️ Serviço: <b>{servico_label}</b>\n"
-          f"💰 Valor total: <b>{valor_str}</b>\n"
-          f"👩‍🦰 Atendido por: <b>{funcionario}</b>")
-    if funcionario=="Daniela" and pct_daniela is not None:
-        valor_dan=round(valor_total*(pct_daniela/100.0),2)
-        base += f"\n\n👩‍🦰 <b>Daniela</b>\n• Percentual: <b>{pct_daniela:.2f}%</b>\n• Recebe: <b>{_fmt_brl(valor_dan)}</b>"
-    if append_sections: base += "\n\n" + "\n\n".join([s for s in append_sections if s and s.strip()])
+                      pct_daniela=None, append_sections=None, conta_pag: str | None = None):
+    valor_str = _fmt_brl(valor_total)
+    forma = (conta_pag or "-")
+    base = (
+        "📌 <b>Atendimento registrado</b>\n"
+        f"👤 Cliente: <b>{cliente}</b>\n"
+        f"🗓️ Data: <b>{data_str}</b>\n"
+        f"🕒 Período: <b>{periodo_label}</b>\n"
+        f"💳 Forma de pagamento: <b>{forma}</b>\n"
+        f"✂️ Serviço: <b>{servico_label}</b>\n"
+        f"💰 Valor total: <b>{valor_str}</b>\n"
+        f"👩‍🦰 Atendido por: <b>{funcionario}</b>"
+    )
+    if funcionario == "Daniela" and pct_daniela is not None:
+        base += "\n" + _calc_payout_daniela(valor_total, pct_daniela)
+    if append_sections:
+        base += "\n\n" + "\n\n".join([s for s in append_sections if s and s.strip()])
     return base
 
-def enviar_card(df_all, cliente, funcionario, data_str, servico=None, valor=None, combo=None, pct_daniela=None):
-    if servico is None or valor is None:
-        servico_label, valor_total, _, _, periodo_label=_resumo_do_dia(df_all, cliente, data_str)
-    else:
-        is_combo=bool(combo and str(combo).strip())
-        servico_label=(f"{servico} (Combo)" if (is_combo or "+" in str(servico)) else f"{servico} (Simples)")
-        valor_total=float(valor)
-        _, _, _, _, periodo_label=_resumo_do_dia(df_all, cliente, data_str)
+def _conta_do_dia(df_all: pd.DataFrame, cliente: str, data_str: str) -> str | None:
+    d = df_all[
+        (df_all["Cliente"].astype(str).str.strip()==cliente) &
+        (df_all["Data"].astype(str).str.strip()==data_str)
+    ]
+    if d.empty or "Conta" not in d.columns: return None
+    s = d["Conta"].astype(str).str.strip()
+    s = s[s!=""]
+    return s.mode().iat[0] if not s.empty else None
 
-    sec_cartao=_secao_pag_cartao(df_all, cliente, data_str)
-    extras=[sec_cartao] if sec_cartao else []
+def enviar_card(df_all, cliente, funcionario, data_str, servico=None, valor=None, combo=None,
+                pct_daniela=None, conta_pag: str | None = None):
+    servico_label = servico or "-"
+    valor_total = float(valor or 0.0)
+    periodo_label = "-"
 
+    if not conta_pag:
+        conta_pag = _conta_do_dia(df_all, cliente, data_str)
+
+    extras = []  # ex: cartão
     caption = make_card_caption(df_all, cliente, data_str, funcionario, servico_label, valor_total, periodo_label,
                                 pct_daniela=(pct_daniela if funcionario=="Daniela" else None),
-                                append_sections=extras)
+                                append_sections=extras, conta_pag=conta_pag)
 
-    foto=FOTOS.get(_norm(cliente))
+    foto = None
 
     # Roteamento
-    if funcionario=="Vinicius":
-        # Vinicius + JP
-        (tg_send_photo(foto, caption, chat_id=_get_chat_id_vini()) if foto else tg_send(caption, chat_id=_get_chat_id_vini()))
-        (tg_send_photo(foto, caption, chat_id=_get_chat_id_jp())   if foto else tg_send(caption, chat_id=_get_chat_id_jp()))
-        return True
-
-    if funcionario=="Daniela":
-        # Daniela + JP
-        (tg_send_photo(foto, caption, chat_id=_get_chat_id_dan()) if foto else tg_send(caption, chat_id=_get_chat_id_dan()))
-        (tg_send_photo(foto, caption, chat_id=_get_chat_id_jp())  if foto else tg_send(caption, chat_id=_get_chat_id_jp()))
-        return True
-
-    if funcionario=="Meire":
-        # Feminino (Meire) + JP
-        (tg_send_photo(foto, caption, chat_id=_get_chat_id_fem()) if foto else tg_send(caption, chat_id=_get_chat_id_fem()))
-        (tg_send_photo(foto, caption, chat_id=_get_chat_id_jp())  if foto else tg_send(caption, chat_id=_get_chat_id_jp()))
-        return True
-
-    # Outros → JP
-    return tg_send_photo(foto, caption, chat_id=_get_chat_id_jp()) if foto else tg_send(caption, chat_id=_get_chat_id_jp())
-
+    if funcionario == "Vinicius":
+        tg_send_photo(foto, caption, chat_id=TELEGRAM_CHAT_ID_VINICIUS)
+        tg_send_photo(foto, caption, chat_id=TELEGRAM_CHAT_ID_JPAULO)
+    elif funcionario == "Daniela":
+        tg_send_photo(foto, caption, chat_id=TELEGRAM_CHAT_ID_DANIELA)
+        tg_send_photo(foto, caption, chat_id=TELEGRAM_CHAT_ID_JPAULO)
+    elif funcionario == "Meire":
+        tg_send_photo(foto, caption, chat_id=TELEGRAM_CHAT_ID_FEMININO)
+        tg_send_photo(foto, caption, chat_id=TELEGRAM_CHAT_ID_JPAULO)
+    else:
+        tg_send_photo(foto, caption, chat_id=TELEGRAM_CHAT_ID_JPAULO)
 # =========================
 # VALORES (exemplo)
 # =========================
