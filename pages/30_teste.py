@@ -193,7 +193,7 @@ def last_day_of_month_from_comp(comp_str: str) -> str:
 # UI
 # =============================
 st.set_page_config(layout="wide")
-st.title(f"💇‍♀️ Comissão — {FUNCIONARIA} (paga TUDO; arredonda base; lança em Despesas do Salão Feminino)")
+st.title(f"💇‍♀️ Comissão — {FUNCIONARIA}")
 
 base=_read_df(ABA_DADOS)
 base=garantir_colunas(base, COLS_OFICIAIS).copy()
