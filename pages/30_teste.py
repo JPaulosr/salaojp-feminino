@@ -325,17 +325,46 @@ with col_m4: st.metric("Fiados pendentes (futuro)", format_brl(total_fiados_pend
 
 # ====== Builder de mensagem (reuso)
 def _tg_build_msg(titulo: str, vis_df: pd.DataFrame) -> str:
+    """
+    Agrupa por (Data, Cliente, Conta) → combos viram uma única linha.
+    Mostra serviços + % comissão aplicado + valor final da comissão.
+    """
     if vis_df is None or vis_df.empty:
         return ""
+
+    df = vis_df.copy()
+    df["Comissão (R$)"] = pd.to_numeric(df["Comissão (R$)"], errors="coerce").fillna(0.0)
+    df["% Comissão"]    = pd.to_numeric(df["% Comissão"], errors="coerce").fillna(0.0)
+    for col in ["Data", "Cliente", "Serviço", "Conta"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # agrupa por (Data, Cliente, Conta)
+    agg = (
+        df.groupby(["Data", "Cliente", "Conta"], dropna=False)
+          .agg(
+              servicos=("Serviço", lambda s: " + ".join([str(x).strip() for x in s if str(x).strip()])),
+              comissao=("Comissão (R$)", "sum"),
+              perc=(" % Comissão" if " % Comissão" in df.columns else "% Comissão", "mean")
+          )
+          .reset_index()
+          .sort_values(["Data", "Cliente"])
+    )
+
     linhas = []
-    for _, r in vis_df.iterrows():
-        dt    = str(r.get("Data","")).strip()
-        cli   = str(r.get("Cliente","")).strip()
-        srv   = str(r.get("Serviço","")).strip()
-        conta = str(r.get("Conta","")).strip()
-        comi  = float(pd.to_numeric(r.get("Comissão (R$)","0"), errors="coerce") or 0.0)
-        linhas.append(f"• {dt} | {cli} — {srv} | <i>{conta}</i>\n   Comissão: <b>{format_brl(comi)}</b>")
-    subtotal = float(pd.to_numeric(vis_df["Comissão (R$)"], errors="coerce").fillna(0.0).sum())
+    for _, r in agg.iterrows():
+        dt    = str(r["Data"]).strip()
+        cli   = str(r["Cliente"]).strip()
+        conta = str(r["Conta"]).strip()
+        srv   = str(r["servicos"]).strip()
+        comi  = float(r["comissao"])
+        perc  = float(r["perc"])
+        linhas.append(
+            f"• {dt} | {cli} — {srv} | <i>{conta}</i>\n"
+            f"   Comissão ({perc:.0f}%): <b>{format_brl(comi)}</b>"
+        )
+
+    subtotal = float(agg["comissao"].sum())
     return f"<b>{titulo}</b>\n" + "\n".join(linhas) + f"\n<b>Subtotal:</b> {format_brl(subtotal)}\n"
 
 def _tg_build_full(vis_nao_fiado: pd.DataFrame, vis_fiado: pd.DataFrame) -> tuple[str,float]:
