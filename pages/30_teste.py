@@ -5,6 +5,7 @@ import streamlit as st
 import pandas as pd
 import gspread
 import hashlib
+import re
 import requests
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 from google.oauth2.service_account import Credentials
@@ -35,8 +36,14 @@ COLS_DESPESAS_FIX = ["Data","Prestador","Descrição","Valor","Me Pag:"]
 PERCENTUAL_PADRAO = 50.0
 
 # =============================
-# TELEGRAM — helpers (com fallback e diagnóstico)
+# TELEGRAM — mesma configuração do 11_Adicionar_Atendimento.py
 # =============================
+TELEGRAM_TOKEN = "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE"
+TELEGRAM_CHAT_ID_JPAULO   = "493747253"
+TELEGRAM_CHAT_ID_VINICIUS = "-1001234567890"
+TELEGRAM_CHAT_ID_FEMININO = "-1002965378062"
+TELEGRAM_CHAT_ID_DANIELA  = "-1003039502089"
+
 def _get_secret(name: str, default: str | None = None) -> str | None:
     try:
         val = st.secrets.get(name)
@@ -47,52 +54,36 @@ def _get_secret(name: str, default: str | None = None) -> str | None:
         pass
     return (default or "").strip() or None
 
-def _chat_id_jp():
-    # tenta específico e cai pro genérico
-    return _get_secret("TELEGRAM_CHAT_ID_JPAULO") or _get_secret("TELEGRAM_CHAT_ID")
+def _get_token() -> str | None:
+    return _get_secret("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
 
-def _chat_id_dani():
-    # tenta específico e cai pro genérico
-    return _get_secret("TELEGRAM_CHAT_ID_DANIELA") or _get_secret("TELEGRAM_CHAT_ID")
+def _get_chat_id_jp() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_JPAULO", TELEGRAM_CHAT_ID_JPAULO)
+
+def _get_chat_id_vini() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_VINICIUS", TELEGRAM_CHAT_ID_VINICIUS)
+
+def _get_chat_id_fem() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_FEMININO", TELEGRAM_CHAT_ID_FEMININO)
+
+def _get_chat_id_dani() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_DANIELA", TELEGRAM_CHAT_ID_DANIELA)
 
 def _check_tg_ready(token: str | None, chat_id: str | None) -> bool:
     return bool((token or "").strip() and (chat_id or "").strip())
 
 def tg_send(text: str, chat_id: str | None = None) -> bool:
-    token = _get_secret("TELEGRAM_TOKEN")
-    chat = chat_id or _get_secret("TELEGRAM_CHAT_ID")  # fallback final
+    token = _get_token()
+    chat = chat_id or _get_chat_id_jp()
     if not _check_tg_ready(token, chat):
-        st.warning("⚠️ Telegram não configurado: verifique TELEGRAM_TOKEN e CHAT_ID(s) nos Secrets.")
         return False
     try:
-        # Telegram limita a 4096 chars → enviar em partes ≤ 4000
-        chunks = []
-        t = text or ""
-        while t:
-            chunks.append(t[:4000])
-            t = t[4000:]
-
-        ok_total = True
-        for part in chunks:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload = {
-                "chat_id": chat,
-                "text": part,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            }
-            r = requests.post(url, json=payload, timeout=30)
-            js = {}
-            if r.headers.get("content-type", "").startswith("application/json"):
-                js = r.json()
-            if not (r.ok and js.get("ok")):
-                ok_total = False
-                st.error(f"❌ Falha ao enviar Telegram (HTTP {r.status_code}): {r.text[:300]}")
-        if ok_total:
-            st.toast("✅ Telegram enviado com sucesso.", icon="✅")
-        return ok_total
-    except Exception as e:
-        st.error(f"❌ Erro no envio ao Telegram: {e}")
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=30)
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+        return bool(r.ok and js.get("ok"))
+    except Exception:
         return False
 
 # =============================
@@ -138,17 +129,13 @@ def _read_config()->dict:
     out={}
     for _,r in df.iterrows():
         s=str(r.get("Serviço","")).strip()
-        try:
-            p=float(str(r.get("PercentualPadrao","")).replace(",",".")) 
-        except:
-            p=None
-        if s and p is not None:
-            out[s]=p
+        try: p=float(str(r.get("PercentualPadrao","")).replace(",",".")) 
+        except: p=None
+        if s and p is not None: out[s]=p
     return out
 
 def _write_config(perc_map:dict):
-    if not perc_map:
-        return
+    if not perc_map: return
     df=pd.DataFrame([{"Serviço":k,"PercentualPadrao":float(v)} for k,v in sorted(perc_map.items())])
     _write_df(ABA_CONFIG, df)
 
@@ -367,8 +354,8 @@ def _tg_build_full(vis_nao_fiado: pd.DataFrame, vis_fiado: pd.DataFrame) -> tupl
 # ====== Botão de PRÉVIA (sem gravar) — somente Telegram
 if st.button("📤 Enviar resumo (sem gravar) — Telegram"):
     msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
-    if notificar_jpaulo and _chat_id_jp():   tg_send(msg, chat_id=_chat_id_jp())
-    if notificar_daniela and _chat_id_dani():tg_send(msg, chat_id=_chat_id_dani())
+    if notificar_jpaulo and _get_chat_id_jp():    tg_send(msg, chat_id=_get_chat_id_jp())
+    if notificar_daniela and _get_chat_id_dani(): tg_send(msg, chat_id=_get_chat_id_dani())
     st.success(f"Resumo enviado por Telegram. Total (prévia): {format_brl(tot)}")
 
 # =============================
@@ -462,8 +449,8 @@ if st.button("✅ Registrar comissão (1 linha por DIA), marcar como pago e envi
 
         # 4) Telegram final (mesma mensagem da prévia)
         msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
-        if notificar_jpaulo and _chat_id_jp():   tg_send(msg, chat_id=_chat_id_jp())
-        if notificar_daniela and _chat_id_dani():tg_send(msg, chat_id=_chat_id_dani())
+        if notificar_jpaulo and _get_chat_id_jp():    tg_send(msg, chat_id=_get_chat_id_jp())
+        if notificar_daniela and _get_chat_id_dani(): tg_send(msg, chat_id=_get_chat_id_dani())
 
         st.success(
             f"🎉 Comissão registrada! {linhas_adicionadas} linha(s) em **{ABA_DESPESAS_SALAO}** "
