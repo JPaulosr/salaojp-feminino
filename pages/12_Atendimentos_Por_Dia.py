@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
-# 15_Atendimentos_Feminino_Por_Dia.py
+# 12_Atendimentos_Por_Dia.py — FEMININO
 # KPIs do dia (Feminino), por funcionária, conferência (gravar/excluir no Sheets)
 # e EXPORTAR PARA MOBILLS (tudo ou só NÃO conferidos) + pós-exportação marcar conferidos.
+#
+# Segurança/Permissões:
+# - No carregamento (cache), NÃO cria a coluna "Conferido" -> evita APIError em planilha protegida.
+# - Só tenta criar/atualizar "Conferido" quando você clica nos botões (com try/except e mensagens claras).
+#
+# Ajustes rápidos:
+# - SHEET_ID: já apontando para a planilha principal do projeto.
+# - ABA_DADOS: "Base de Dados Feminino".
+# - FUNCIONARIAS: lista com os nomes a considerar nos KPIs.
 
 import streamlit as st
 import pandas as pd
@@ -11,6 +20,7 @@ import plotly.express as px
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe
 from gspread.utils import rowcol_to_a1
+from gspread.exceptions import APIError
 from datetime import datetime, date
 import pytz
 import numpy as np
@@ -64,40 +74,49 @@ def _headers_and_indices(ws):
     headers = ws.row_values(1)
     norms = [_norm_col(h) for h in headers]
     idxs = [i for i, n in enumerate(norms) if n == "conferido"]  # 0-based
-    chosen = idxs[-1] if idxs else None  # SEMPRE a última
+    chosen = idxs[-1] if idxs else None  # última ocorrência
     return headers, norms, idxs, chosen
 
-def _ensure_conferido_column(ws):
-    """Garante coluna 'Conferido' e retorna índice 1-based da ÚLTIMA ocorrência."""
+def _ensure_conferido_column(ws, create_if_missing: bool = False):
+    """
+    Retorna o índice 1-based da ÚLTIMA coluna 'Conferido'.
+    Se não existir:
+      - se create_if_missing=True, tenta criar; se falhar, retorna None (modo somente leitura)
+      - se create_if_missing=False, apenas retorna None (não tenta escrever no Sheets)
+    """
     headers, norms, idxs, chosen = _headers_and_indices(ws)
     if chosen is not None:
         return chosen + 1  # 1-based
-    col = len(headers) + 1
-    ws.update_cell(1, col, "Conferido")
-    return col
 
-def _update_conferido(ws, updates):
-    """Atualiza 1 a 1 para garantir persistência na mesma coluna."""
-    if not updates: return
-    col_conf = _ensure_conferido_column(ws)
-    for u in updates:
-        row = int(u["row"])
-        val = "TRUE" if u["value"] else "FALSE"
-        ws.update_cell(row, col_conf, val)
+    if not create_if_missing:
+        # Modo seguro: não tenta escrever. Útil no carregamento (cache) para evitar APIError.
+        return None
 
-def _delete_rows(ws, rows):
-    for r in sorted(set(rows), reverse=True):
-        try:
-            ws.delete_rows(int(r))
-        except Exception as e:
-            st.warning(f"Falha ao excluir linha {r}: {e}")
+    try:
+        col = len(headers) + 1
+        ws.update_cell(1, col, "Conferido")
+        return col
+    except APIError:
+        st.warning("Sem permissão para criar a coluna 'Conferido' (somente leitura).")
+        return None
+    except Exception as e:
+        st.warning(f"Não foi possível criar a coluna 'Conferido': {e}")
+        return None
 
 def _fetch_conferido_map(ws):
-    """Lê a ÚLTIMA coluna 'Conferido' e devolve {SheetRow:int -> bool}."""
-    col_conf = _ensure_conferido_column(ws)
-    a1 = rowcol_to_a1(1, col_conf)  # e.g. 'W1' ou 'AA1'
+    """
+    Lê a ÚLTIMA coluna 'Conferido' diretamente do Sheets e devolve {SheetRow:int -> bool}.
+    NUNCA tenta criar a coluna aqui (evita erro em cache).
+    """
+    col_conf = _ensure_conferido_column(ws, create_if_missing=False)
+    if not col_conf:
+        return {}  # sem coluna, sem conferidos
+
+    # Captura letras da coluna (suporta AA, AB...)
+    a1 = rowcol_to_a1(1, col_conf)  # e.g. 'W1' / 'AA1'
     col_letters = "".join(ch for ch in a1 if ch.isalpha())
-    rng = f"{col_letters}2:{col_letters}"
+
+    rng = f"{col_letters}2:{col_letters}"  # coluna inteira a partir da linha 2
     vals = ws.get(rng, value_render_option="UNFORMATTED_VALUE")
 
     m = {}
@@ -114,6 +133,40 @@ def _fetch_conferido_map(ws):
         m[rownum] = b
         rownum += 1
     return m
+
+def _update_conferido(ws, updates):
+    """
+    Atualiza a coluna 'Conferido' linha a linha. Se não houver coluna ou sem permissão,
+    informa e não tenta escrever.
+    """
+    if not updates:
+        return
+
+    col_conf = _ensure_conferido_column(ws, create_if_missing=True)
+    if not col_conf:
+        st.error("Sem permissão para atualizar 'Conferido' (planilha em somente leitura).")
+        return
+
+    for u in updates:
+        try:
+            row = int(u["row"])
+            val = "TRUE" if u["value"] else "FALSE"
+            ws.update_cell(row, col_conf, val)
+        except APIError:
+            st.error("O Google Sheets não permitiu gravar 'Conferido' (verifique permissões/proteções).")
+            break
+        except Exception as e:
+            st.warning(f"Falha ao atualizar linha {u.get('row')}: {e}")
+
+def _delete_rows(ws, rows):
+    for r in sorted(set(rows), reverse=True):
+        try:
+            ws.delete_rows(int(r))
+        except APIError:
+            st.error(f"Sheets bloqueou exclusão da linha {r} (verifique permissões/proteções).")
+            break
+        except Exception as e:
+            st.warning(f"Falha ao excluir linha {r}: {e}")
 
 # ---------- leitura base ----------
 @st.cache_data(ttl=60, show_spinner=False)
@@ -169,7 +222,7 @@ def carregar_base():
             return 0.0
     df["Valor_num"] = df["Valor"].apply(parse_valor)
 
-    # 'Conferido' direto da coluna correta do Sheets
+    # 'Conferido' direto da coluna correta do Sheets (modo leitura; não cria se faltar)
     conferido_map = _fetch_conferido_map(ws)
     df["Conferido"] = df["SheetRow"].map(lambda r: bool(conferido_map.get(int(r), False))).astype(bool)
 
@@ -391,24 +444,33 @@ if st.button("✅ Aplicar mudanças (gravar no Sheets)", type="primary"):
         sh = gc.open_by_key(SHEET_ID)
         ws = sh.worksheet(ABA_DADOS)
 
-        # Atualiza 'Conferido'
-        orig_by_row = df_conf.set_index("SheetRow")["Conferido"].apply(_to_bool).to_dict()
-        updates = []
-        for _, r in edited.iterrows():
-            rownum = int(r["SheetRow"])
-            new_val = bool(_to_bool(r["Conferido"]))
-            old_val = bool(_to_bool(orig_by_row.get(rownum, False)))
-            if new_val != old_val:
-                updates.append({"row": rownum, "value": new_val})
-        _update_conferido(ws, updates)
+        # checagem de escrita: tentamos garantir/descobrir a coluna (criando se faltar)
+        can_write_col = _ensure_conferido_column(ws, create_if_missing=True)
+        if not can_write_col:
+            st.error("Sem permissão para escrever no Sheets (somente leitura).")
+        else:
+            # Atualiza 'Conferido'
+            orig_by_row = df_conf.set_index("SheetRow")["Conferido"].apply(_to_bool).to_dict()
+            updates = []
+            for _, r in edited.iterrows():
+                rownum = int(r["SheetRow"])
+                new_val = bool(_to_bool(r["Conferido"]))
+                old_val = bool(_to_bool(orig_by_row.get(rownum, False)))
+                if new_val != old_val:
+                    updates.append({"row": rownum, "value": new_val})
+            _update_conferido(ws, updates)
 
-        # Exclui marcados
-        rows_to_delete = [int(r["SheetRow"]) for _, r in edited.iterrows() if bool(_to_bool(r["Excluir"]))]
-        _delete_rows(ws, rows_to_delete)
+            # Exclui marcados (isso também exige permissão de editor)
+            rows_to_delete = [int(r["SheetRow"]) for _, r in edited.iterrows() if bool(_to_bool(r["Excluir"]))]
+            if rows_to_delete:
+                _delete_rows(ws, rows_to_delete)
 
-        st.success("Alterações aplicadas com sucesso!")
-        st.cache_data.clear()
-        st.rerun()
+            st.success("Alterações aplicadas com sucesso!")
+            st.cache_data.clear()
+            st.rerun()
+
+    except APIError:
+        st.error("O Google Sheets rejeitou a escrita (permissões/proteções).")
     except Exception as e:
         st.error(f"Falha ao aplicar mudanças: {e}")
 
@@ -533,10 +595,18 @@ else:
             gc = _conectar_sheets()
             sh = gc.open_by_key(SHEET_ID)
             ws = sh.worksheet(ABA_DADOS)
-            updates = [{"row": int(r), "value": True} for r in df_export_base["SheetRow"].tolist()]
-            _update_conferido(ws, updates)
-            st.success(f"Marcados {len(updates)} registros como Conferidos.")
-            st.cache_data.clear()
-            st.rerun()
+
+            can_write_col = _ensure_conferido_column(ws, create_if_missing=True)
+            if not can_write_col:
+                st.error("Sem permissão para escrever no Sheets (somente leitura).")
+            else:
+                updates = [{"row": int(r), "value": True} for r in df_export_base["SheetRow"].tolist()]
+                _update_conferido(ws, updates)
+                st.success(f"Marcados {len(updates)} registros como Conferidos.")
+                st.cache_data.clear()
+                st.rerun()
+
+        except APIError:
+            st.error("O Google Sheets rejeitou a escrita (permissões/proteções).")
         except Exception as e:
             st.error(f"Falha ao marcar como conferidos: {e}")
