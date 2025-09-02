@@ -826,7 +826,7 @@ if not modo_lote:
                 c1, c2 = st.columns(2)
                 with c1:
                     liquido = st.number_input("Valor recebido (líquido)", value=float(total_bruto_padrao), step=1.0, format="%.2f")
-                    bandeira = st.selectbox("Bandeira", ["", "Visa", "Mastercard", "Elo", "Hipercard", "Amex", "Outros"], index=0)
+                    bandeira = st.selectbox("Bandeira", ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"], index=0)
                 with c2:
                     tipo_cartao = st.selectbox("Tipo", ["Débito", "Crédito"], index=1)
                     parcelas = st.number_input("Parcelas (se crédito)", min_value=1, max_value=12, value=1, step=1)
