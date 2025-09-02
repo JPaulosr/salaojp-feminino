@@ -988,7 +988,7 @@ else:
                         c1, c2 = st.columns(2)
                         with c1:
                             st.number_input(f"{cli} - Valor recebido (líquido)", value=float(st.session_state.get(f"valor_{_keyify(cli)}_simples", 0.0)), step=1.0, key=f"liq_{_keyify(cli)}")
-                            st.selectbox(f"{cli} - Bandeira", ["", "Visa", "Mastercard", "Elo", "Hipercard", "Amex", "Outros"], index=0, key=f"bandeira_{_keyify(cli)}")
+                            st.selectbox(f"{cli} - Bandeira", ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"], index=0, key=f"bandeira_{_keyify(cli)}")
                         with c2:
                             st.selectbox(f"{cli} - Tipo", ["Débito", "Crédito"], index=1, key=f"tipo_cartao_{_keyify(cli)}")
                             st.number_input(f"{cli} - Parcelas", min_value=1, max_value=12, value=1, step=1, key=f"parc_{_keyify(cli)}")
