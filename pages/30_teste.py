@@ -189,6 +189,56 @@ def last_day_of_month_from_comp(comp_str: str) -> str:
     last_day = calendar.monthrange(y, m)[1]
     return f"{last_day:02d}/{m:02d}/{y}"
 
+# ---------- Normalização de nomes de serviço ----------
+def normalizar_servico(s: str) -> str:
+    s0 = (s or "").strip().lower()
+    mapa = {
+        "sobrancelhas": "Sobrancelha",
+        "sobrancelha": "Sobrancelha",
+        "luz": "Luzes",
+        "luzes": "Luzes",
+        "pezinho": "Pezinho",
+        "barba": "Barba",
+        "corte": "Corte",
+        "alisamento": "Alisamento",
+        "tintura": "Tintura",
+        "gel": "Gel",
+        "pomada": "Pomada",
+        "caixinha": "Caixinha",
+    }
+    return mapa.get(s0, s.strip() if s else "")
+
+# ---------- Garantir coluna de comissão por linha (respeita % do grid) ----------
+def _ensure_comissao(df: pd.DataFrame, perc_padrao: float = PERCENTUAL_PADRAO) -> pd.DataFrame:
+    tmp = df.copy()
+    base_col = "Valor (para comissão)" if "Valor (para comissão)" in tmp.columns else "Valor_base_comissao"
+    base = pd.to_numeric(tmp[base_col], errors="coerce").fillna(0.0)
+
+    if "ComissaoValor" in tmp.columns:
+        com = pd.to_numeric(tmp["ComissaoValor"], errors="coerce").fillna(0.0)
+    else:
+        if "% Comissão" in tmp.columns:
+            pct = pd.to_numeric(tmp["% Comissão"], errors="coerce").fillna(float(perc_padrao))
+        else:
+            pct = float(perc_padrao)
+        com = (base * pct / 100.0).astype(float)
+
+    tmp["__comissao"] = com
+    return tmp
+
+# ---------- Agregador: comissão por serviço ----------
+def _agg_por_servico_comissao(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Serviço","Qtde","Comissão (R$)"])
+    tmp = df.copy()
+    if "Serviço" in tmp.columns:
+        tmp["Serviço"] = tmp["Serviço"].astype(str).map(normalizar_servico)
+    tmp = _ensure_comissao(tmp)
+    out = (tmp.groupby("Serviço", dropna=False)
+              .agg(Qtde=("Serviço","count"), **{"Comissão (R$)":("__comissao","sum")})
+              .reset_index())
+    return out.sort_values("Comissão (R$)", ascending=False)
+
 # =============================
 # UI
 # =============================
@@ -322,6 +372,53 @@ def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
 grid_nao_fiado, total_nao_fiado, vis_nao_fiado = preparar_grid(nao_fiado, "Não fiado (a pagar)", "nao_fiado")
 grid_fiado,     total_fiado,     vis_fiado     = preparar_grid(fiado_lib,  "Fiados liberados (a pagar)", "fiado_lib")
 
+# ============================================
+# 🔎 Conferência rápida (atendimentos pagáveis agora)
+# ============================================
+st.markdown("## 🔎 Conferência rápida (atendimentos pagáveis hoje)")
+
+# Junta os itens que serão pagos AGORA (usa os *grids* já filtrados/editados)
+partes = []
+for d in [grid_nao_fiado, grid_fiado]:
+    if d is not None and not d.empty:
+        partes.append(d.copy())
+df_pagaveis = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame(
+    columns=["Data","Cliente","Serviço","Valor_base_comissao","% Comissão","ComissaoValor","RefID"]
+)
+
+# Métricas gerais
+if df_pagaveis.empty:
+    st.info("Nenhum atendimento pagável agora.")
+else:
+    tmp_full = _ensure_comissao(df_pagaveis)
+    base_col = "Valor (para comissão)" if "Valor (para comissão)" in tmp_full.columns else "Valor_base_comissao"
+
+    tot_bruto   = float(pd.to_numeric(tmp_full[base_col], errors="coerce").fillna(0.0).sum())
+    tot_com     = float(pd.to_numeric(tmp_full["__comissao"], errors="coerce").fillna(0.0).sum())
+    tot_atends  = int(tmp_full.shape[0])
+
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("💰 Valor bruto (sistema, sem caixinha)", format_brl(round(tot_bruto,2)))
+    with c2: st.metric("💵 Comissão (sistema, sem caixinha)",     format_brl(round(tot_com,2)))
+    with c3: st.metric("🧾 Qtde total de atendimentos",           f"{tot_atends}")
+
+    # Tabela de comissão por serviço
+    agg_sis = _agg_por_servico_comissao(df_pagaveis).copy()
+    agg_sis["Comissão (R$)"] = pd.to_numeric(agg_sis["Comissão (R$)"], errors="coerce").round(2)
+    st.dataframe(agg_sis.reset_index(drop=True), use_container_width=True)
+
+    # Drill-down: ver linhas de um serviço
+    st.markdown("### 🔍 Ver linhas por serviço")
+    serv_list = sorted(agg_sis["Serviço"].astype(str).unique()) if not agg_sis.empty else []
+    serv_sel = st.selectbox("Escolha um serviço:", serv_list or ["—"])
+    if serv_sel and serv_sel != "—":
+        mask = df_pagaveis["Serviço"].astype(str).map(normalizar_servico) == serv_sel
+        cols_show = ["Data","Cliente","Serviço"]
+        for extra in ["Valor (para comissão)","Valor_base_comissao","% Comissão","ComissaoValor","Competência","RefID","Conta"]:
+            if extra in df_pagaveis.columns: cols_show.append(extra)
+        st.dataframe(df_pagaveis.loc[mask, cols_show].reset_index(drop=True), use_container_width=True)
+        st.caption("Essas são as linhas consideradas pelo sistema para este serviço.")
+
 # ====== Fiados pendentes (sempre visível)
 st.subheader("📌 Fiados pendentes (histórico — ainda NÃO pagos)")
 if fiado_pend.empty:
@@ -368,7 +465,7 @@ def _tg_build_msg(titulo: str, vis_df: pd.DataFrame) -> str:
     agg = (
         df.groupby(["Data", "Cliente", "Conta"], dropna=False)
           .agg(
-              servicos=("Serviço", lambda s: " + ".join([str(x).strip() for x in s if str(x).strip()])),
+              servicos=("Serviço", lambda s: " + ".join([normalizar_servico(str(x)) for x in s if str(x).strip()])),
               comissao=("Comissão (R$)", "sum"),
               perc=(perc_col, "mean")
           )
