@@ -1,614 +1,457 @@
-# -*- coding: utf-8 -*-
-# 12_Comissoes_Daniela.py — Comissão Daniela (paga TUDO, arredonda base, envia prévia no Telegram e grava em Despesas do Salão Feminino)
-
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 import gspread
-import hashlib
-import re
-import requests
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
-from datetime import datetime, date
-import calendar
-import pytz
-from math import ceil
+import unicodedata
 
-# =============================
-# CONFIG BÁSICA
-# =============================
+st.set_page_config(layout="wide")
+st.title("🧍‍♀️ Clientes (Feminino) - Receita Total")
+
+# === CONFIG GOOGLE SHEETS ===
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 
-ABA_DADOS            = "Base de Dados Feminino"
-ABA_COMISSOES_CACHE  = "comissoes_cache_feminino"
-ABA_DESPESAS_SALAO   = "Despesas do Salão Feminino"   # alvo de lançamento
-ABA_CONFIG           = "config_comissoes_feminino"     # persiste % por serviço
-
-TZ = "America/Sao_Paulo"
-FUNCIONARIA = "Daniela"
-
-COLS_OFICIAIS = [
-    "Data","Serviço","Valor","Conta","Cliente","Combo",
-    "Funcionário","Fase","Tipo","Período",
-    "StatusFiado","IDLancFiado","VencimentoFiado","DataPagamento"
+# Possíveis nomes das guias (variações)
+BASE_ALVOS = [
+    "base de dados feminino", "base de dados - feminino",
+    "base de dados (feminino)", "base de dados feminino "
 ]
-COLS_DESPESAS_FIX = ["Data","Prestador","Descrição","Valor","Me Pag:"]
+STATUS_ALVOS = [
+    "clientes_status_feminino", "clientes status feminino",
+    "clientes_status feminino", "status_feminino"
+]
 
-PERCENTUAL_PADRAO = 50.0
+# -----------------------------
+# Utils
+# -----------------------------
+def norm(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
+    return " ".join(s.lower().strip().split())
 
-# =============================
-# TELEGRAM — mesma configuração do 11_Adicionar_Atendimento.py
-# =============================
-TELEGRAM_TOKEN = "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE"
-TELEGRAM_CHAT_ID_JPAULO   = "493747253"
-TELEGRAM_CHAT_ID_VINICIUS = "-1001234567890"
-TELEGRAM_CHAT_ID_FEMININO = "-1002965378062"
-TELEGRAM_CHAT_ID_DANIELA  = "-1003039502089"
+def parse_valor_qualquer(v):
+    """Converte 'R$ 1.234,56', '1.234,56', '25,00', '25.00', '25.0' ou número em float (sem inflar)."""
+    if pd.isna(v): return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
 
-def _get_secret(name: str, default: str | None = None) -> str | None:
-    try:
-        val = st.secrets.get(name)
-        val = (val or "").strip()
-        if val:
-            return val
-    except Exception:
+    s = str(v).strip().replace("\u00A0", "")
+    s = s.replace("R$", "").replace("r$", "").replace(" ", "")
+
+    tem_virg = "," in s
+    tem_ponto = "." in s
+
+    if tem_virg and tem_ponto:
+        # PT-BR: milhar '.' e decimal ','
+        s = s.replace(".", "").replace(",", ".")
+    elif tem_virg and not tem_ponto:
+        # Só vírgula -> decimal
+        s = s.replace(",", ".")
+    else:
+        # Só ponto (ou nenhum) -> ponto é decimal
         pass
-    return (default or "").strip() or None
 
-def _get_token() -> str | None:
-    return _get_secret("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
-
-def _get_chat_id_jp() -> str | None:
-    return _get_secret("TELEGRAM_CHAT_ID_JPAULO", TELEGRAM_CHAT_ID_JPAULO)
-
-def _get_chat_id_vini() -> str | None:
-    return _get_secret("TELEGRAM_CHAT_ID_VINICIUS", TELEGRAM_CHAT_ID_VINICIUS)
-
-def _get_chat_id_fem() -> str | None:
-    return _get_secret("TELEGRAM_CHAT_ID_FEMININO", TELEGRAM_CHAT_ID_FEMININO)
-
-def _get_chat_id_dani() -> str | None:
-    return _get_secret("TELEGRAM_CHAT_ID_DANIELA", TELEGRAM_CHAT_ID_DANIELA)
-
-def _check_tg_ready(token: str | None, chat_id: str | None) -> bool:
-    return bool((token or "").strip() and (chat_id or "").strip())
-
-def tg_send(text: str, chat_id: str | None = None) -> bool:
-    token = _get_token()
-    chat = chat_id or _get_chat_id_jp()
-    if not _check_tg_ready(token, chat):
-        return False
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-        r = requests.post(url, json=payload, timeout=30)
-        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-        return bool(r.ok and js.get("ok"))
+        return float(s)
     except Exception:
-        return False
+        x = pd.to_numeric(s, errors="coerce")
+        return float(x) if pd.notna(x) else 0.0
 
-# =============================
-# CONEXÃO SHEETS
-# =============================
-@st.cache_resource
-def _conn():
-    info = st.secrets["GCP_SERVICE_ACCOUNT"]
-    scopes = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
-    cred = Credentials.from_service_account_info(info, scopes=scopes)
-    cli = gspread.authorize(cred)
-    return cli.open_by_key(SHEET_ID)
-
-def _ws(title:str):
-    sh=_conn()
-    try:
-        return sh.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows=2000, cols=50)
-
-def _read_df(title:str)->pd.DataFrame:
-    ws=_ws(title)
-    df=get_as_dataframe(ws).fillna("")
-    df.columns=[str(c).strip() for c in df.columns]
-    df=df.dropna(how="all").replace({pd.NA:""})
-    return df
-
-def _write_df(title:str, df:pd.DataFrame):
-    ws=_ws(title); ws.clear()
-    set_with_dataframe(ws, df, include_index=False, include_column_header=True)
-
-# =============================
-# CONFIG (% por serviço) — persistência
-# =============================
-def _read_config()->dict:
-    try:
-        df=_read_df(ABA_CONFIG)
-    except Exception:
-        df=pd.DataFrame(columns=["Serviço","PercentualPadrao"])
-    if "Serviço" not in df.columns or "PercentualPadrao" not in df.columns:
-        df=pd.DataFrame(columns=["Serviço","PercentualPadrao"])
-    df["Serviço"]=df["Serviço"].astype(str).str.strip()
-    out={}
-    for _,r in df.iterrows():
-        s=str(r.get("Serviço","")).strip()
-        try: p=float(str(r.get("PercentualPadrao","")).replace(",",".")) 
-        except: p=None
-        if s and p is not None: out[s]=p
-    return out
-
-def _write_config(perc_map:dict):
-    if not perc_map: return
-    df=pd.DataFrame([{"Serviço":k,"PercentualPadrao":float(v)} for k,v in sorted(perc_map.items())])
-    _write_df(ABA_CONFIG, df)
-
-# =============================
-# HELPERS
-# =============================
-def br_now(): return datetime.now(pytz.timezone(TZ))
-def parse_br_date(s:str):
-    s=(s or "").strip()
-    for fmt in ("%d/%m/%Y","%d-%m-%Y","%Y-%m-%d"):
-        try: return datetime.strptime(s, fmt)
-        except: pass
+def achar_col(df, nomes):
+    alvo = [n.strip().lower() for n in nomes]
+    for c in df.columns:
+        if c and c.strip().lower() in alvo:
+            return c
     return None
-def to_br_date(dt:datetime): return dt.strftime("%d/%m/%Y")
-def competencia_from_date(dt:datetime|None):
-    return dt.strftime("%m/%Y") if dt else ""
-def competencia_from_data_str(s:str):
-    return competencia_from_date(parse_br_date(s))
-def s_lower(s): return s.astype(str).str.strip().str.lower()
-def garantir_colunas(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    df = df.copy()
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
+
+def find_worksheet(planilha, alvos_norm):
+    wss = planilha.worksheets()
+    titulos = [ws.title for ws in wss]
+    titulos_norm = [norm(t) for t in titulos]
+    # 1) match exato
+    for ws, tnorm in zip(wss, titulos_norm):
+        if tnorm in alvos_norm:
+            return ws
+    # 2) contém
+    for ws, tnorm in zip(wss, titulos_norm):
+        if any(a in tnorm for a in alvos_norm):
+            return ws
+    st.error("❌ Não encontrei a aba feminina. Guias disponíveis:\n- " + "\n- ".join(titulos))
+    st.stop()
+
+def excel_col_letter(idx1_based: int) -> str:
+    """Converte índice de coluna 1-based em letra (1->A, 2->B...)."""
+    s = ""
+    n = idx1_based
+    while n > 0:
+        n, r = divmod(n-1, 26)
+        s = chr(65 + r) + s
+    return s
+
+# === Conexão ===
+@st.cache_resource
+def conectar_sheets():
+    info = st.secrets["GCP_SERVICE_ACCOUNT"]
+    escopo = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    credenciais = Credentials.from_service_account_info(info, scopes=escopo)
+    cliente = gspread.authorize(credenciais)
+    return cliente.open_by_key(SHEET_ID)
+
+# === Carregar dados Feminino ===
+@st.cache_data(ttl=300)  # evita base antiga por muito tempo
+def carregar_dados():
+    planilha = conectar_sheets()
+    ws = find_worksheet(planilha, [norm(x) for x in BASE_ALVOS])
+    df = get_as_dataframe(ws).dropna(how="all")
+    df.columns = [col.strip() for col in df.columns]
+
+    if "Data" not in df.columns:
+        st.error("❌ Coluna 'Data' não encontrada na aba feminina."); st.stop()
+
+    df["Data"] = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
+    df = df.dropna(subset=["Data"])
+    df["Ano"] = df["Data"].dt.year.astype(int)
+
+    col_serv = achar_col(df, ["Serviço", "Servico"])
+    if col_serv and col_serv != "Serviço":
+        df.rename(columns={col_serv: "Serviço"}, inplace=True)
+
+    col_valor = achar_col(df, ["Valor"])
+    if col_valor and col_valor != "Valor":
+        df.rename(columns={col_valor: "Valor"}, inplace=True)
+
+    col_conta = achar_col(df, ["Conta", "Forma de pagamento", "Pagamento", "Status"])
+    if col_conta and col_conta != "Conta":
+        df.rename(columns={col_conta: "Conta"}, inplace=True)
+
+    col_cli = achar_col(df, ["Cliente"])
+    if col_cli and col_cli != "Cliente":
+        df.rename(columns={col_cli: "Cliente"}, inplace=True)
+
+    df["Cliente"] = df["Cliente"].astype(str).str.strip()
+    df["ValorNum"] = df["Valor"].apply(parse_valor_qualquer)
     return df
-def make_refid(row:pd.Series)->str:
-    key="|".join([
-        str(row.get("Cliente","")).strip(),
-        str(row.get("Data","")).strip(),
-        str(row.get("Serviço","")).strip(),
-        str(row.get("Valor","")).strip(),
-        str(row.get("Funcionário","")).strip(),
-        str(row.get("Combo","")).strip(),
-    ])
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-def arredonda_para_cima_mult5(v:float)->float:
-    try: v=float(v)
-    except: return 0.0
-    return float(ceil(v/5.0)*5.0)
-def format_brl(v:float)->str:
-    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
-def last_day_of_month_from_comp(comp_str: str) -> str:
-    """Recebe 'mm/AAAA' e retorna 'DD/mm/AAAA' com o último dia daquele mês."""
-    comp_str = (comp_str or "").strip()
-    if not re.match(r"^\d{2}/\d{4}$", comp_str):
-        return to_br_date(br_now())  # fallback: hoje
-    m, y = comp_str.split("/")
-    y = int(y); m = int(m)
-    last_day = calendar.monthrange(y, m)[1]
-    return f"{last_day:02d}/{m:02d}/{y}"
+@st.cache_data(ttl=300)  # idem
+def carregar_status_df():
+    """Lê a planilha de status (para indicadores na tela)."""
+    try:
+        planilha = conectar_sheets()
+        ws = find_worksheet(planilha, [norm(x) for x in STATUS_ALVOS])
+        df = get_as_dataframe(ws).dropna(how="all")
+        df.columns = [c.strip() for c in df.columns]
+        col_cli = achar_col(df, ["Cliente"]); col_sta = achar_col(df, ["Status"])
+        if not col_cli or not col_sta:
+            return pd.DataFrame(columns=["Cliente", "Status"])
+        out = df[[col_cli, col_sta]].copy()
+        out.columns = ["Cliente", "Status"]
+        out["Cliente"] = out["Cliente"].astype(str).str.strip()
+        out["Status"] = out["Status"].astype(str).str.strip()
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["Cliente", "Status"])
 
-# ---------- Normalização de nomes de serviço ----------
-def normalizar_servico(s: str) -> str:
-    s0 = (s or "").strip().lower()
-    mapa = {
-        "sobrancelhas": "Sobrancelha",
-        "sobrancelha": "Sobrancelha",
-        "luz": "Luzes",
-        "luzes": "Luzes",
-        "pezinho": "Pezinho",
-        "barba": "Barba",
-        "corte": "Corte",
-        "alisamento": "Alisamento",
-        "tintura": "Tintura",
-        "gel": "Gel",
-        "pomada": "Pomada",
-        "caixinha": "Caixinha",
-    }
-    return mapa.get(s0, s.strip() if s else "")
+def atualizar_status_clientes_batch(status_map_norm: dict) -> int:
+    """
+    Atualiza a coluna 'Status' da aba FEMININO em uma única chamada,
+    comparando clientes por nome normalizado (sem acento/caixa/espaços).
+    Não altera linhas cujo Status atual seja 'Ignorado' (case-insensitive).
+    status_map_norm: { norm(nome_cliente) : "Ativo"/"Inativo" }
+    Retorna a quantidade de linhas alteradas.
+    """
+    planilha = conectar_sheets()
+    ws = find_worksheet(planilha, [norm(x) for x in STATUS_ALVOS])
 
-# ---------- Garantir coluna de comissão por linha (respeita % do grid) ----------
-def _ensure_comissao(df: pd.DataFrame, perc_padrao: float = PERCENTUAL_PADRAO) -> pd.DataFrame:
-    tmp = df.copy()
-    base_col = "Valor (para comissão)" if "Valor (para comissão)" in tmp.columns else "Valor_base_comissao"
-    base = pd.to_numeric(tmp[base_col], errors="coerce").fillna(0.0)
+    vals = ws.get_all_values()   # [[Cliente, Status, ...], ...]
+    if not vals:
+        return 0
 
-    if "ComissaoValor" in tmp.columns:
-        com = pd.to_numeric(tmp["ComissaoValor"], errors="coerce").fillna(0.0)
-    else:
-        if "% Comissão" in tmp.columns:
-            pct = pd.to_numeric(tmp["% Comissão"], errors="coerce").fillna(float(perc_padrao))
+    header = [h.strip() for h in vals[0]]
+    try:
+        cli_idx0 = header.index("Cliente")         # 0-based
+        sta_idx0 = header.index("Status")
+    except ValueError:
+        cli_idx0, sta_idx0 = 0, 1  # fallback
+
+    linhas = vals[1:]
+    novos_status = []
+    alterados = 0
+
+    for row in linhas:
+        nome_raw = (row[cli_idx0] if cli_idx0 < len(row) else "").strip()
+        atual    = (row[sta_idx0] if sta_idx0 < len(row) else "").strip()
+
+        # mantém "Ignorado"
+        if atual.lower() == "ignorado":
+            novos_status.append([atual])
+            continue
+
+        alvo_norm = norm(nome_raw)
+        novo = status_map_norm.get(alvo_norm, atual) or atual
+
+        if novo != atual:
+            alterados += 1
+        novos_status.append([novo])
+
+    if alterados == 0:
+        return 0
+
+    col_letra = excel_col_letter(sta_idx0 + 1)  # idx 1-based
+    inicio = 2
+    fim = len(vals)
+    rng = f"{col_letra}{inicio}:{col_letra}{fim}"
+
+    ws.update(rng, novos_status, value_input_option="RAW")
+    return alterados
+
+# =============================
+# Execução
+# =============================
+df = carregar_dados()
+df_status = carregar_status_df()
+
+# =============================
+# 🔄 Status automático (com normalização + botão)
+# =============================
+st.markdown("### 🔄 Status automático de clientes (90 dias)")
+
+# Base completa para cálculo do último atendimento (sem filtro de ano)
+df_full = df.copy()
+hoje = pd.Timestamp.today().normalize()
+
+ultimos = df_full.groupby("Cliente")["Data"].max().reset_index()
+ultimos["DiasDesde"] = (hoje - ultimos["Data"]).dt.days
+ultimos["StatusNovo"] = ultimos["DiasDesde"].apply(lambda x: "Inativo" if x > 90 else "Ativo")
+
+# NÃO mexer nos "Ignorado"
+ignorados_set = set()
+if not df_status.empty and "Status" in df_status.columns and "Cliente" in df_status.columns:
+    ignorados_set = set(df_status.loc[df_status["Status"].str.lower().eq("ignorado"), "Cliente"].astype(str))
+
+# monta mapa normalizado (pula ignorados)
+status_map_norm = {}
+for _, r in ultimos.iterrows():
+    if r["Cliente"] in ignorados_set:
+        continue
+    status_map_norm[norm(r["Cliente"])] = r["StatusNovo"]
+
+colA, colB = st.columns([1,1])
+if colA.button("🔄 Atualizar status agora"):
+    try:
+        alterados = atualizar_status_clientes_batch(status_map_norm)
+        if alterados > 0:
+            st.cache_data.clear()  # limpa caches de dados/status
+            df_status = carregar_status_df()
+            st.success(f"Status atualizado com sucesso ({alterados} linha(s) alterada(s)).")
         else:
-            pct = float(perc_padrao)
-        com = (base * pct / 100.0).astype(float)
-
-    tmp["__comissao"] = com
-    return tmp
-
-# ---------- Agregador: comissão por serviço ----------
-def _agg_por_servico_comissao(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Serviço","Qtde","Comissão (R$)"])
-    tmp = df.copy()
-    if "Serviço" in tmp.columns:
-        tmp["Serviço"] = tmp["Serviço"].astype(str).map(normalizar_servico)
-    tmp = _ensure_comissao(tmp)
-    out = (tmp.groupby("Serviço", dropna=False)
-              .agg(Qtde=("Serviço","count"), **{"Comissão (R$)":("__comissao","sum")})
-              .reset_index())
-    return out.sort_values("Comissão (R$)", ascending=False)
+            st.info("Nenhuma alteração necessária. (Todos já estavam corretos ou eram 'Ignorado').")
+    except Exception as e:
+        st.error(f"Falha ao atualizar status: {e}")
 
 # =============================
-# UI
+# Filtro por Ano (mantém o ano atual e a última escolha)
 # =============================
-st.set_page_config(layout="wide")
-st.title(f"💇‍♀️ Comissão — {FUNCIONARIA}")
+anos = sorted(df["Ano"].unique().tolist())
+ano_atual = pd.Timestamp.today().year
+if ano_atual not in anos:
+    anos.append(ano_atual)
+    anos = sorted(anos)
 
-base=_read_df(ABA_DADOS)
-base=garantir_colunas(base, COLS_OFICIAIS).copy()
-PERC_SALVOS=_read_config()
+opcoes_ano = ["Todos"] + anos
 
-colA,colB,colC=st.columns([1,1,1])
-with colA:
-    perc_padrao=st.number_input("Percentual padrão (%)", value=PERCENTUAL_PADRAO, step=1.0, min_value=0.0, max_value=100.0)
-with colB:
-    incluir_produtos=st.checkbox("Incluir PRODUTOS?", value=False)
-with colC:
-    meio_pag=st.selectbox("Meio de pagamento (para DESPESAS)", ["Dinheiro","Pix","Cartão","Transferência"], index=0)
+if "ano_selecionado" not in st.session_state:
+    st.session_state["ano_selecionado"] = ano_atual
 
-descricao_padrao=st.text_input("Descrição (para DESPESAS)", value=f"Comissão {FUNCIONARIA}")
+valor_inicial = st.session_state["ano_selecionado"]
+if valor_inicial not in opcoes_ano:
+    valor_inicial = ano_atual
 
-colN1, colN2, colN3 = st.columns(3)
-with colN1: notificar_jpaulo  = st.checkbox("Enviar Telegram para JPaulo",  value=True)
-with colN2: notificar_daniela = st.checkbox("Enviar Telegram para Daniela", value=True)
-with colN3: salvar_no_cache   = st.checkbox("Gravar histórico no comissoes_cache_feminino?", value=False)
+ano_escolhido = st.selectbox(
+    "📅 Selecione o ano",
+    opcoes_ano,
+    index=opcoes_ano.index(valor_inicial)
+)
+st.session_state["ano_selecionado"] = ano_escolhido
 
-# ====== Seleção de dados (PAGA TUDO) ======
-dfv=base[s_lower(base["Funcionário"])==FUNCIONARIA.lower()].copy()
-if not incluir_produtos:
-    dfv=dfv[s_lower(dfv["Tipo"])=="serviço"].copy()
+# =============================
+# Máscara FIADO e base filtrada por ano
+# =============================
+if "Conta" in df.columns:
+    mask_fiado_full = df["Conta"].fillna("").astype(str).str.strip().str.lower().eq("fiado")
+else:
+    mask_fiado_full = pd.Series(False, index=df.index)
 
-dfv["_dt_serv"]=dfv["Data"].apply(parse_br_date)
-dfv["RefID"]=dfv.apply(make_refid, axis=1)
+if ano_escolhido == "Todos":
+    df_base = df.copy()
+else:
+    df_base = df[df["Ano"] == ano_escolhido].copy()
 
-# cache de pagos
-cache=_read_df(ABA_COMISSOES_CACHE)
-cache_cols=["RefID","Funcionario","PagoEm","TerçaPagamento","ValorComissao","Competencia","Observacao"]
-cache=garantir_colunas(cache, cache_cols)
-ja_pagos=set(cache[s_lower(cache["Funcionario"])==FUNCIONARIA.lower()]["RefID"].astype(str).tolist())
+mask_fiado = mask_fiado_full.loc[df_base.index]
+df_receita = df_base[~mask_fiado].copy()
+df_fiado = df_base[mask_fiado].copy()
 
-# separa fiado e não fiado
-hoje=br_now()
-df_fiados = dfv[(s_lower(dfv["StatusFiado"])!="") | (s_lower(dfv["IDLancFiado"])!="")]
-df_fiados["_dt_pagto"]=df_fiados["DataPagamento"].apply(parse_br_date)
+# =============================
+# Indicadores
+# =============================
+clientes_unicos = df_base["Cliente"].nunique()
+contagem_status = df_status["Status"].value_counts().to_dict() if not df_status.empty else {}
+ativos = contagem_status.get("Ativo", 0)
+ignorados = contagem_status.get("Ignorado", 0)
+inativos = contagem_status.get("Inativo", 0)
 
-nao_fiado = dfv[(s_lower(dfv["StatusFiado"])=="") | (s_lower(dfv["StatusFiado"])=="nao")].copy()
-fiado_lib = df_fiados[(df_fiados["_dt_pagto"].notna()) & (df_fiados["_dt_pagto"]<=hoje)].copy()
-fiado_pend= df_fiados[(df_fiados["_dt_pagto"].isna())  | (df_fiados["_dt_pagto"]>hoje)].copy()
+st.markdown("### 📊 Indicadores Gerais (Feminino)")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("👥 Clientes únicas", clientes_unicos)
+c2.metric("✅ Ativas", ativos)
+c3.metric("🚫 Ignoradas", ignorados)
+c4.metric("🚩 Inativas", inativos)
 
-if ja_pagos:
-    nao_fiado = nao_fiado[~nao_fiado["RefID"].isin(ja_pagos)].copy()
-    fiado_lib = fiado_lib[~fiado_lib["RefID"].isin(ja_pagos)].copy()
+# Limpa nomes genéricos
+ban = {"boliviano", "brasileiro", "menino", "menino boliviano"}
+for _df in (df_base, df_receita, df_fiado):
+    _df.drop(_df[_df["Cliente"].astype(str).str.lower().str.strip().isin(ban)].index, inplace=True)
 
-st.info("Modo: pagando <b>TUDO</b> que ainda não foi pago — Não fiado + Fiados com DataPagamento ≤ hoje.", icon="💸")
-
-# ====== Monta valor base arredondado ======
-def montar_valor_base(df:pd.DataFrame)->pd.DataFrame:
-    if df.empty:
-        df["Valor_num"]=[]; df["Competência"]=[]; df["Valor_base_comissao"]=[]; df["CompetênciaPagto"]=[]
-        return df
-    df=df.copy()
-    df["Valor_num"]=pd.to_numeric(df["Valor"], errors="coerce").fillna(0.0)
-    df["Competência"]=df["Data"].apply(competencia_from_data_str)
-    df["Valor_base_comissao"]=df["Valor_num"].apply(arredonda_para_cima_mult5)
-    # Competência para lançamento da DESPESA:
-    # - Não fiado: usa mês de Data (atendimento)
-    # - Fiado liberado: usa mês de DataPagamento
-    if "DataPagamento" in df.columns:
-        df["CompetênciaPagto"] = df.apply(
-            lambda r: competencia_from_data_str(r.get("DataPagamento")) if str(r.get("DataPagamento","")).strip() else competencia_from_data_str(r.get("Data","")),
-            axis=1
-        )
-    else:
-        df["CompetênciaPagto"] = df["Competência"]
-    return df
-
-nao_fiado = montar_valor_base(nao_fiado)
-fiado_lib = montar_valor_base(fiado_lib)
-fiado_pend= montar_valor_base(fiado_pend)
-
-# ====== Editor com recalculo em tempo real ======
-def preparar_grid(df:pd.DataFrame, titulo:str, key_prefix:str):
-    if df.empty:
-        st.subheader(titulo)
-        st.warning("Sem itens.")
-        return pd.DataFrame(), 0.0, pd.DataFrame()
-
-    df=df.copy()
-    ed = df[["Data","Cliente","Serviço","Conta","Valor_base_comissao","Competência","RefID"]].rename(
-        columns={"Valor_base_comissao":"Valor (para comissão)"}
-    )
-    ed["% Comissão"] = ed["Serviço"].apply(lambda s: float(PERC_SALVOS.get(str(s).strip(), perc_padrao)))
-    ed["Comissão (R$)"] = (
-        pd.to_numeric(ed["Valor (para comissão)"], errors="coerce").fillna(0.0) *
-        pd.to_numeric(ed["% Comissão"], errors="coerce").fillna(0.0) / 100.0
-    ).round(2)
-    ed = ed.reset_index(drop=True)
-
-    edited = st.data_editor(
-        ed,
-        key=f"editor_{key_prefix}",
-        num_rows="fixed",
-        column_config={
-            "Valor (para comissão)": st.column_config.NumberColumn(format="R$ %.2f"),
-            "% Comissão": st.column_config.NumberColumn(format="%.1f %%", min_value=0.0, max_value=100.0, step=0.5),
-            "Comissão (R$)": st.column_config.NumberColumn(format="R$ %.2f", disabled=True),
-        },
-        use_container_width=True
-    )
-
-    # arredonda valor digitado e recalcula
-    edited = edited.copy()
-    edited["Valor (para comissão)"] = edited["Valor (para comissão)"].apply(
-        lambda x: arredonda_para_cima_mult5(float(pd.to_numeric(x, errors="coerce") or 0.0))
-    )
-    edited["% Comissão"] = pd.to_numeric(edited["% Comissão"], errors="coerce").fillna(0.0)
-    edited["Comissão (R$)"] = (edited["Valor (para comissão)"] * edited["% Comissão"] / 100.0).round(2)
-
-    total=float(edited["Comissão (R$)"].sum())
-
-    merged = df.merge(
-        edited[["RefID","Valor (para comissão)","% Comissão","Comissão (R$)","Competência","Data","Cliente","Serviço","Conta"]],
-        on="RefID", how="left"
-    )
-    merged["ValorBaseEditado"]=pd.to_numeric(merged["Valor (para comissão)"], errors="coerce").fillna(0.0)
-    merged["PercComissao"]=pd.to_numeric(merged["% Comissão"], errors="coerce").fillna(0.0)
-    merged["ComissaoValor"]=pd.to_numeric(merged["Comissão (R$)"], errors="coerce").fillna(0.0)
-
-    st.success(f"Total em **{titulo}**: {format_brl(total)}")
-    return merged, total, edited
-
-grid_nao_fiado, total_nao_fiado, vis_nao_fiado = preparar_grid(nao_fiado, "Não fiado (a pagar)", "nao_fiado")
-grid_fiado,     total_fiado,     vis_fiado     = preparar_grid(fiado_lib,  "Fiados liberados (a pagar)", "fiado_lib")
-
-# ============================================
-# 🔎 Conferência rápida (atendimentos pagáveis agora)
-# ============================================
-st.markdown("## 🔎 Conferência rápida (atendimentos pagáveis hoje)")
-
-# Junta os itens que serão pagos AGORA (usa os *grids* já filtrados/editados)
-partes = []
-for d in [grid_nao_fiado, grid_fiado]:
-    if d is not None and not d.empty:
-        partes.append(d.copy())
-df_pagaveis = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame(
-    columns=["Data","Cliente","Serviço","Valor_base_comissao","% Comissão","ComissaoValor","RefID"]
+# =============================
+# Receita total por cliente (ano filtrado)
+# =============================
+ranking = (df_receita.groupby("Cliente")["ValorNum"].sum()
+           .reset_index().rename(columns={"ValorNum": "Valor"})
+           .sort_values("Valor", ascending=False))
+ranking["Valor Formatado"] = ranking["Valor"].apply(
+    lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
 )
 
-# Métricas gerais
-if df_pagaveis.empty:
-    st.info("Nenhum atendimento pagável agora.")
+st.subheader("📟 Receita total por cliente (Feminino)")
+busca = st.text_input("🔎 Filtrar por nome").strip()
+if busca:
+    busca_norm = norm(busca)
+    rank_view = ranking[ranking["Cliente"].apply(lambda n: busca_norm in norm(n))]
 else:
-    tmp_full = _ensure_comissao(df_pagaveis)
-    base_col = "Valor (para comissão)" if "Valor (para comissão)" in tmp_full.columns else "Valor_base_comissao"
+    rank_view = ranking
+st.dataframe(rank_view[["Cliente", "Valor Formatado"]], use_container_width=True)
 
-    tot_bruto   = float(pd.to_numeric(tmp_full[base_col], errors="coerce").fillna(0.0).sum())
-    tot_com     = float(pd.to_numeric(tmp_full["__comissao"], errors="coerce").fillna(0.0).sum())
-    tot_atends  = int(tmp_full.shape[0])
-
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("💰 Valor bruto (sistema, sem caixinha)", format_brl(round(tot_bruto,2)))
-    with c2: st.metric("💵 Comissão (sistema, sem caixinha)",     format_brl(round(tot_com,2)))
-    with c3: st.metric("🧾 Qtde total de atendimentos",           f"{tot_atends}")
-
-    # Tabela de comissão por serviço
-    agg_sis = _agg_por_servico_comissao(df_pagaveis).copy()
-    agg_sis["Comissão (R$)"] = pd.to_numeric(agg_sis["Comissão (R$)"], errors="coerce").round(2)
-    st.dataframe(agg_sis.reset_index(drop=True), use_container_width=True)
-
-    # Drill-down: ver linhas de um serviço
-    st.markdown("### 🔍 Ver linhas por serviço")
-    serv_list = sorted(agg_sis["Serviço"].astype(str).unique()) if not agg_sis.empty else []
-    serv_sel = st.selectbox("Escolha um serviço:", serv_list or ["—"])
-    if serv_sel and serv_sel != "—":
-        mask = df_pagaveis["Serviço"].astype(str).map(normalizar_servico) == serv_sel
-        cols_show = ["Data","Cliente","Serviço"]
-        for extra in ["Valor (para comissão)","Valor_base_comissao","% Comissão","ComissaoValor","Competência","RefID","Conta"]:
-            if extra in df_pagaveis.columns: cols_show.append(extra)
-        st.dataframe(df_pagaveis.loc[mask, cols_show].reset_index(drop=True), use_container_width=True)
-        st.caption("Essas são as linhas consideradas pelo sistema para este serviço.")
-
-# ====== Fiados pendentes (sempre visível)
-st.subheader("📌 Fiados pendentes (histórico — ainda NÃO pagos)")
-if fiado_pend.empty:
-    st.info("Nenhum fiado pendente no momento.")
-    total_fiados_pend = 0.0
-else:
-    visp = fiado_pend[["Data","Cliente","Serviço","Conta","Valor","Valor_base_comissao","Competência"]].rename(
-        columns={"Valor_base_comissao":"Valor (para comissão)"}
-    )
-    visp["% Comissão"] = visp["Serviço"].apply(lambda s: float(PERC_SALVOS.get(str(s).strip(), perc_padrao)))
-    visp["Comissão (R$)"] = (
-        pd.to_numeric(visp["Valor (para comissão)"], errors="coerce").fillna(0.0) *
-        pd.to_numeric(visp["% Comissão"], errors="coerce").fillna(0.0) / 100.0
-    ).round(2)
-    total_fiados_pend = float(visp["Comissão (R$)"].sum())
-    st.dataframe(visp.sort_values(by=["Data","Cliente"]).reset_index(drop=True), use_container_width=True)
-st.warning(f"Comissão futura (quando pagarem): **{format_brl(total_fiados_pend)}**")
-
-# ====== Resumo
-col_m1,col_m2,col_m3,col_m4=st.columns(4)
-with col_m1: st.metric("Não fiado (a pagar)", format_brl(total_nao_fiado))
-with col_m2: st.metric("Fiados liberados (a pagar)", format_brl(total_fiado))
-with col_m3: st.metric("Total desta execução", format_brl(total_nao_fiado+total_fiado))
-with col_m4: st.metric("Fiados pendentes (futuro)", format_brl(total_fiados_pend))
-
-# ====== Builder de mensagem (reuso)
-def _tg_build_msg(titulo: str, vis_df: pd.DataFrame) -> str:
-    """
-    Agrupa por (Data, Cliente, Conta) → combos viram uma única linha.
-    Mostra serviços + % comissão aplicado + valor final da comissão.
-    """
-    if vis_df is None or vis_df.empty:
-        return ""
-
-    df = vis_df.copy()
-    df["Comissão (R$)"] = pd.to_numeric(df["Comissão (R$)"], errors="coerce").fillna(0.0)
-    df["% Comissão"]    = pd.to_numeric(df["% Comissão"], errors="coerce").fillna(0.0)
-    for col in ["Data", "Cliente", "Serviço", "Conta"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    # agrupa por (Data, Cliente, Conta)
-    perc_col = "% Comissão" if "% Comissão" in df.columns else " % Comissão"
-    agg = (
-        df.groupby(["Data", "Cliente", "Conta"], dropna=False)
-          .agg(
-              servicos=("Serviço", lambda s: " + ".join([normalizar_servico(str(x)) for x in s if str(x).strip()])),
-              comissao=("Comissão (R$)", "sum"),
-              perc=(perc_col, "mean")
-          )
-          .reset_index()
-          .sort_values(["Data", "Cliente"])
-    )
-
-    linhas = []
-    for _, r in agg.iterrows():
-        dt    = str(r["Data"]).strip()
-        cli   = str(r["Cliente"]).strip()
-        conta = str(r["Conta"]).strip()
-        srv   = str(r["servicos"]).strip()
-        comi  = float(r["comissao"])
-        perc  = float(r["perc"])
-        linhas.append(
-            f"• {dt} | {cli} — {srv} | <i>{conta}</i>\n"
-            f"   Comissão ({perc:.0f}%): <b>{format_brl(comi)}</b>"
-        )
-
-    subtotal = float(agg["comissao"].sum())
-    return f"<b>{titulo}</b>\n" + "\n".join(linhas) + f"\n<b>Subtotal:</b> {format_brl(subtotal)}\n"
-
-def _tg_build_full(vis_nao_fiado: pd.DataFrame, vis_fiado: pd.DataFrame) -> tuple[str,float]:
-    hoje_str = to_br_date(br_now())
-    tot = float(
-        (vis_nao_fiado["Comissão (R$)"].sum() if vis_nao_fiado is not None and not vis_nao_fiado.empty else 0.0) +
-        (vis_fiado["Comissão (R$)"].sum()     if vis_fiado     is not None and not vis_fiado.empty     else 0.0)
-    )
-    msg  = f"<b>Comissão — {FUNCIONARIA}</b>\nData de processamento: {hoje_str}\n\n"
-    msg += _tg_build_msg("Não fiado (pagos agora)", vis_nao_fiado)
-    if msg and not msg.endswith("\n"): msg += "\n"
-    msg += _tg_build_msg("Fiados liberados (pagos agora)", vis_fiado)
-    msg += "\n<b>Total geral desta execução:</b> " + format_brl(tot)
-    return msg, tot
-
-# ====== Botão de PRÉVIA (sem gravar) — somente Telegram
-if st.button("📤 Enviar resumo (sem gravar) — Telegram"):
-    msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
-    if notificar_jpaulo and _get_chat_id_jp():    tg_send(msg, chat_id=_get_chat_id_jp())
-    if notificar_daniela and _get_chat_id_dani(): tg_send(msg, chat_id=_get_chat_id_dani())
-    st.success(f"Resumo enviado por Telegram. Total (prévia): {format_brl(tot)}")
+# Top 5
+st.subheader("🏆 Top 5 Clientes por Receita")
+top5 = ranking.head(5)
+fig_top = px.bar(
+    top5, x="Cliente", y="Valor",
+    text=top5["Valor"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v", ".")),
+    labels={"Valor": "Receita (R$)"}, color="Cliente", template="plotly_dark", height=400
+)
+fig_top.update_traces(textposition="outside", cliponaxis=False)
+fig_top.update_layout(showlegend=False)
+st.plotly_chart(fig_top, use_container_width=True)
 
 # =============================
-# CONFIRMAR E GRAVAR
+# Resultado por cliente por ANO (sempre sem fiado)
 # =============================
-if st.button("✅ Registrar comissão (1 linha por MÊS/Competência), lançar em DESPESAS e enviar Telegram"):
-    if (grid_nao_fiado is None or grid_nao_fiado.empty) and (grid_fiado is None or grid_fiado.empty):
-        st.warning("Não há itens para pagar.")
-    else:
-        hoje_str=to_br_date(br_now())
+st.subheader("🗓️ Resultado por cliente por ano (sem fiado)")
 
-        # 0) (Opcional) Atualiza cache (anti-duplicidade) — desativado por padrão
-        if salvar_no_cache:
-            novos_cache=[]
-            for df_part in [grid_nao_fiado, grid_fiado]:
-                if df_part is None or df_part.empty: continue
-                for _,r in df_part.iterrows():
-                    novos_cache.append({
-                        "RefID": r["RefID"],
-                        "Funcionario": FUNCIONARIA,
-                        "PagoEm": hoje_str,
-                        "TerçaPagamento": "",  # sem janela fixa
-                        "ValorComissao": f'{float(r["ComissaoValor"]):.2f}'.replace(".", ","),
-                        "Competencia": r.get("Competência",""),
-                        "Observacao": f'{r.get("Cliente","")} | {r.get("Serviço","")} | {r.get("Data","")}',
-                    })
-            cache_df=_read_df(ABA_COMISSOES_CACHE)
-            cache_df=garantir_colunas(cache_df, ["RefID","Funcionario","PagoEm","TerçaPagamento","ValorComissao","Competencia","Observacao"])
-            cache_upd=pd.concat([cache_df[["RefID","Funcionario","PagoEm","TerçaPagamento","ValorComissao","Competencia","Observacao"]], pd.DataFrame(novos_cache)], ignore_index=True)
-            _write_df(ABA_COMISSOES_CACHE, cache_upd)
+df_sem_fiado = df[~mask_fiado_full].copy()
+df_sem_fiado = df_sem_fiado[~df_sem_fiado["Cliente"].astype(str).str.lower().str.strip().isin(ban)]
 
-        # 1) DESPESAS DO SALÃO FEMININO (1 linha por MÊS/Competência de pagamento)
-        despesas_df=_read_df(ABA_DESPESAS_SALAO)
-        despesas_df=garantir_colunas(despesas_df, COLS_DESPESAS_FIX)
+tabela_cliente_ano = (df_sem_fiado
+    .groupby(["Cliente", "Ano"])["ValorNum"].sum()
+    .reset_index()
+    .sort_values(["Cliente", "Ano"]))
 
-        pagaveis=[]
-        # Não fiado: competência de DESPESA = mês da Data do atendimento
-        if grid_nao_fiado is not None and not grid_nao_fiado.empty:
-            nf = grid_nao_fiado[["CompetênciaPagto","ComissaoValor"]].copy()
-            nf = nf.rename(columns={"CompetênciaPagto":"CompPagto"})
-            pagaveis.append(nf)
+pivot_cliente_ano = tabela_cliente_ano.pivot(index="Cliente", columns="Ano", values="ValorNum").fillna(0.0)
+pivot_fmt = pivot_cliente_ano.applymap(lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
 
-        # Fiado liberado: competência de DESPESA = mês da DataPagamento
-        if grid_fiado is not None and not grid_fiado.empty:
-            fl = grid_fiado[["CompetênciaPagto","ComissaoValor"]].copy()
-            fl = fl.rename(columns={"CompetênciaPagto":"CompPagto"})
-            pagaveis.append(fl)
+st.dataframe(pivot_fmt, use_container_width=True)
 
-        linhas_adicionadas=0
-        total_lancado = 0.0
-        if pagaveis:
-            pagos=pd.concat(pagaveis, ignore_index=True)
-            pagos["ComissaoValor"] = pd.to_numeric(pagos["ComissaoValor"], errors="coerce").fillna(0.0)
+if not tabela_cliente_ano.empty:
+    st.markdown("**Evolução por ano (selecione uma cliente):**")
+    clientes_lista = sorted(tabela_cliente_ano["Cliente"].unique().tolist())
+    cliente_sel = st.selectbox("👤 Cliente", clientes_lista, index=0)
+    df_cli = tabela_cliente_ano[tabela_cliente_ano["Cliente"] == cliente_sel]
+    fig_cli = px.bar(
+        df_cli, x="Ano", y="ValorNum",
+        text=df_cli["ValorNum"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v", ".")),
+        labels={"ValorNum": "Receita (R$)"}, template="plotly_dark", height=380
+    )
+    fig_cli.update_traces(textposition="outside", cliponaxis=False)
+    st.plotly_chart(fig_cli, use_container_width=True)
 
-            por_comp = pagos.groupby(["CompPagto"], dropna=False)["ComissaoValor"].sum().reset_index()
+# =============================
+# Comparativo entre duas clientes (respeita filtro de ano)
+# =============================
+st.subheader("⚖️ Comparar duas clientes")
+if not ranking.empty:
+    colA, colB = st.columns(2)
+    c1_sel = colA.selectbox("👤 Cliente 1", ranking["Cliente"].tolist())
+    idx2 = 1 if len(ranking) > 1 else 0
+    c2_sel = colB.selectbox("👤 Cliente 2", ranking["Cliente"].tolist(), index=idx2)
 
-            linhas=[]
-            for _,row in por_comp.iterrows():
-                comp = str(row["CompPagto"]).strip() or competencia_from_date(br_now())
-                val  = float(row["ComissaoValor"])
-                data_lcto = last_day_of_month_from_comp(comp)   # <-- aqui garantimos o "dia 31" (ou 30/29/28 conforme o mês)
+    df_c1_val = df_receita[df_receita["Cliente"] == c1_sel]
+    df_c2_val = df_receita[df_receita["Cliente"] == c2_sel]
+    df_c1_hist = df_base[df_base["Cliente"] == c1_sel]
+    df_c2_hist = df_base[df_base["Cliente"] == c2_sel]
 
-                linhas.append({
-                    "Data": data_lcto,
-                    "Prestador": FUNCIONARIA,
-                    "Descrição": f"{descricao_padrao} — Comp {comp} — Processado em {hoje_str}",
-                    "Valor": f'R$ {val:.2f}'.replace(".", ","),
-                    "Me Pag:": meio_pag
-                })
-                total_lancado += val
+    def resumo_cliente(df_val, df_hist):
+        total = df_val["ValorNum"].sum()
+        servicos = df_hist["Serviço"].nunique() if "Serviço" in df_hist.columns else 0
+        media = df_val.groupby("Data")["ValorNum"].sum().mean()
+        media = 0 if pd.isna(media) else media
+        servicos_detalhados = (df_hist["Serviço"].value_counts().rename("Quantidade")
+                               if "Serviço" in df_hist.columns else pd.Series(dtype=int))
+        return pd.Series({
+            "Total Receita": f"R$ {total:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."),
+            "Serviços Distintos": servicos,
+            "Tique Médio": f"R$ {media:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+        }), servicos_detalhados
 
-            despesas_final=pd.concat([despesas_df, pd.DataFrame(linhas)], ignore_index=True)
-            colunas_finais=[c for c in COLS_DESPESAS_FIX if c in despesas_final.columns] + \
-                           [c for c in despesas_final.columns if c not in COLS_DESPESAS_FIX]
-            despesas_final=despesas_final[colunas_finais]
-            _write_df(ABA_DESPESAS_SALAO, despesas_final)
-            linhas_adicionadas=len(linhas)
+    r1, s1 = resumo_cliente(df_c1_val, df_c1_hist)
+    r2, s2 = resumo_cliente(df_c2_val, df_c2_hist)
+    st.dataframe(pd.concat([r1.rename(c1_sel), r2.rename(c2_sel)], axis=1), use_container_width=True)
+    st.markdown("**Serviços Realizados por Tipo**")
+    st.dataframe(pd.concat([s1.rename(c1_sel), s2.rename(c2_sel)].copy(), axis=1).fillna(0).astype(int), use_container_width=True)
 
-        # 2) Persiste últimos % por serviço
-        perc_atualizados=dict(PERC_SALVOS)
-        def _coleta_percentuais(vis_df):
-            out={}
-            if vis_df is None or vis_df.empty: return out
-            col = "% Comissão" if "% Comissão" in vis_df.columns else " % Comissão"
-            for _,r in vis_df.iterrows():
-                s=str(r.get("Serviço","")).strip()
-                try: p=float(str(r.get(col,"")).replace(",", "."))
-                except: p=None
-                if s and p is not None: out[s]=p
-            return out
-        for m in (_coleta_percentuais(vis_nao_fiado), _coleta_percentuais(vis_fiado)):
-            perc_atualizados.update(m)
-        _write_config(perc_atualizados)
+# =============================
+# Fiados (respeita filtro de ano)
+# =============================
+st.markdown("### 💳 Fiados — Resumo e Detalhes (Feminino)")
+total_fiado = df_fiado["ValorNum"].sum()
+colf1, colf2, colf3 = st.columns(3)
+colf1.metric("💸 Total em fiado (aberto)", f"R$ {total_fiado:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
+colf2.metric("👤 Clientes com fiado", int(df_fiado["Cliente"].nunique()))
+colf3.metric("🧾 Registros de fiado", int(len(df_fiado)))
 
-        # 3) Telegram final (mesma mensagem da prévia)
-        msg, tot = _tg_build_full(vis_nao_fiado, vis_fiado)
-        if notificar_jpaulo and _get_chat_id_jp():    tg_send(msg, chat_id=_get_chat_id_jp())
-        if notificar_daniela and _get_chat_id_dani(): tg_send(msg, chat_id=_get_chat_id_dani())
+if not df_fiado.empty:
+    top_fiado = (df_fiado.groupby("Cliente")["ValorNum"].sum()
+                 .reset_index().sort_values("ValorNum", ascending=False).head(10))
+    top_fiado["Valor Formatado"] = top_fiado["ValorNum"].apply(
+        lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    )
+    fig_fiado = px.bar(
+        top_fiado, x="Cliente", y="ValorNum", text=top_fiado["Valor Formatado"],
+        labels={"ValorNum": "Fiado (R$)"}, color="Cliente",
+        template="plotly_dark", height=380
+    )
+    fig_fiado.update_traces(textposition="outside", cliponaxis=False)
+    fig_fiado.update_layout(showlegend=False)
+    st.plotly_chart(fig_fiado, use_container_width=True)
 
-        st.success(
-            f"🎉 Comissão registrada! {linhas_adicionadas} linha(s) em **{ABA_DESPESAS_SALAO}** (1 por competência, Data = último dia do mês). "
-            f"Total lançado: {format_brl(total_lancado)}"
-            + ("" if not salvar_no_cache else " | Histórico atualizado em comissoes_cache_feminino.")
-        )
-        st.balloons()
+    cols_base = ["Data", "Cliente", "Serviço", "ValorNum"] if "Serviço" in df_fiado.columns else ["Data", "Cliente", "ValorNum"]
+    fiado_detalhe = (df_fiado[cols_base]
+                     .sort_values(by=["Cliente", "Data"], ascending=[True, False])
+                     .rename(columns={"ValorNum": "Valor"}))
+    fiado_detalhe["Valor"] = fiado_detalhe["Valor"].apply(
+        lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
+    )
+    st.dataframe(fiado_detalhe, use_container_width=True)
+else:
+    st.info("Nenhum fiado em aberto encontrado para os filtros atuais (feminino).")
+
+# =============================
+# Navegar para detalhamento
+# =============================
+st.subheader("🔍 Ver detalhamento de uma cliente")
+if not ranking.empty:
+    cliente_escolhido = st.selectbox("📌 Escolha uma cliente", ranking["Cliente"].tolist())
+    if st.button("➡ Ver detalhes"):
+        st.session_state["cliente"] = cliente_escolhido
+        st.switch_page("pages/2_DetalhesCliente.py")
