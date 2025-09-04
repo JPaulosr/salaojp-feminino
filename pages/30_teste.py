@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -5,6 +6,7 @@ import gspread
 from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
 import unicodedata
+import requests
 
 st.set_page_config(layout="wide")
 st.title("🧍‍♀️ Clientes (Feminino) - Receita Total")
@@ -22,6 +24,13 @@ STATUS_ALVOS = [
     "clientes_status feminino", "status_feminino"
 ]
 
+# === TELEGRAM ===
+TG_TOKEN   = st.secrets["TELEGRAM"]["TOKEN"]
+TG_CHAT_ID = st.secrets["TELEGRAM"]["CHAT_ID"]
+
+# Logo padrão quando não existir foto da cliente
+LOGO_PADRAO = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
+
 # -----------------------------
 # Utils
 # -----------------------------
@@ -37,23 +46,14 @@ def parse_valor_qualquer(v):
     if pd.isna(v): return 0.0
     if isinstance(v, (int, float)):
         return float(v)
-
     s = str(v).strip().replace("\u00A0", "")
     s = s.replace("R$", "").replace("r$", "").replace(" ", "")
-
     tem_virg = "," in s
     tem_ponto = "." in s
-
     if tem_virg and tem_ponto:
-        # PT-BR: milhar '.' e decimal ','
         s = s.replace(".", "").replace(",", ".")
     elif tem_virg and not tem_ponto:
-        # Só vírgula -> decimal
         s = s.replace(",", ".")
-    else:
-        # Só ponto (ou nenhum) -> ponto é decimal
-        pass
-
     try:
         return float(s)
     except Exception:
@@ -83,13 +83,41 @@ def find_worksheet(planilha, alvos_norm):
     st.stop()
 
 def excel_col_letter(idx1_based: int) -> str:
-    """Converte índice de coluna 1-based em letra (1->A, 2->B...)."""
     s = ""
     n = idx1_based
     while n > 0:
         n, r = divmod(n-1, 26)
         s = chr(65 + r) + s
     return s
+
+# --- Telegram helpers ---
+def tg_send(text: str, chat_id: str = None, parse_mode: str = "HTML"):
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        data = {
+            "chat_id": chat_id or TG_CHAT_ID,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        st.warning(f"Falha ao enviar Telegram: {e}")
+
+def tg_send_photo(photo_url: str, caption: str, chat_id: str = None, parse_mode: str = "HTML"):
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+        data = {
+            "chat_id": chat_id or TG_CHAT_ID,
+            "caption": caption[:1024],   # limite prático da legenda
+            "parse_mode": parse_mode
+        }
+        files = None
+        # envio simples com URL
+        data["photo"] = photo_url or LOGO_PADRAO
+        requests.post(url, data=data, files=files, timeout=15)
+    except Exception as e:
+        st.warning(f"Falha ao enviar foto no Telegram: {e}")
 
 # === Conexão ===
 @st.cache_resource
@@ -101,7 +129,7 @@ def conectar_sheets():
     return cliente.open_by_key(SHEET_ID)
 
 # === Carregar dados Feminino ===
-@st.cache_data(ttl=300)  # evita base antiga por muito tempo
+@st.cache_data(ttl=300)
 def carregar_dados():
     planilha = conectar_sheets()
     ws = find_worksheet(planilha, [norm(x) for x in BASE_ALVOS])
@@ -135,43 +163,68 @@ def carregar_dados():
     df["ValorNum"] = df["Valor"].apply(parse_valor_qualquer)
     return df
 
-@st.cache_data(ttl=300)  # idem
+@st.cache_data(ttl=300)
 def carregar_status_df():
-    """Lê a planilha de status (para indicadores na tela)."""
+    """Lê a planilha de status (para indicadores e fotos)."""
     try:
         planilha = conectar_sheets()
         ws = find_worksheet(planilha, [norm(x) for x in STATUS_ALVOS])
         df = get_as_dataframe(ws).dropna(how="all")
         df.columns = [c.strip() for c in df.columns]
-        col_cli = achar_col(df, ["Cliente"]); col_sta = achar_col(df, ["Status"])
+
+        # identificar colunas núcleo
+        col_cli = achar_col(df, ["Cliente"])
+        col_sta = achar_col(df, ["Status"])
         if not col_cli or not col_sta:
-            return pd.DataFrame(columns=["Cliente", "Status"])
-        out = df[[col_cli, col_sta]].copy()
-        out.columns = ["Cliente", "Status"]
+            out = pd.DataFrame(columns=["Cliente", "Status"])
+        else:
+            out = df[[col_cli, col_sta]].copy()
+            out.columns = ["Cliente", "Status"]
+
+        # tentar identificar coluna de foto/link
+        col_foto = achar_col(df, ["Foto", "Imagem", "Image", "URL", "Link", "FotoURL", "Foto Url", "Foto_Link"])
+        if col_foto:
+            out["FotoURL"] = df[col_foto].astype(str).fillna("").values
+        else:
+            out["FotoURL"] = ""
+
         out["Cliente"] = out["Cliente"].astype(str).str.strip()
-        out["Status"] = out["Status"].astype(str).str.strip()
+        out["Status"]  = out["Status"].astype(str).str.strip()
         return out
     except Exception:
-        return pd.DataFrame(columns=["Cliente", "Status"])
+        return pd.DataFrame(columns=["Cliente", "Status", "FotoURL"])
 
-def atualizar_status_clientes_batch(status_map_norm: dict) -> int:
+def foto_da_cliente(nome: str, df_status: pd.DataFrame) -> str:
+    """Retorna URL da foto da cliente, se existir no status; senão, LOGO_PADRAO."""
+    if df_status is None or df_status.empty:
+        return LOGO_PADRAO
+    linha = df_status.loc[df_status["Cliente"].astype(str).str.strip() == str(nome).strip()]
+    if not linha.empty:
+        url = str(linha.iloc[0].get("FotoURL", "")).strip()
+        return url if url else LOGO_PADRAO
+    return LOGO_PADRAO
+
+def atualizar_status_clientes_batch(status_map_norm: dict):
     """
     Atualiza a coluna 'Status' da aba FEMININO em uma única chamada,
     comparando clientes por nome normalizado (sem acento/caixa/espaços).
     Não altera linhas cujo Status atual seja 'Ignorado' (case-insensitive).
+
     status_map_norm: { norm(nome_cliente) : "Ativo"/"Inativo" }
-    Retorna a quantidade de linhas alteradas.
+
+    Retorna: (alterados:int, mudancas:list[dict]) onde cada item:
+        {"cliente": <str>, "antes": <str>, "depois": <str>}
     """
     planilha = conectar_sheets()
     ws = find_worksheet(planilha, [norm(x) for x in STATUS_ALVOS])
 
-    vals = ws.get_all_values()   # [[Cliente, Status, ...], ...]
+    vals = ws.get_all_values()
     if not vals:
-        return 0
+        return 0, []
 
     header = [h.strip() for h in vals[0]]
     try:
-        cli_idx0 = header.index("Cliente")         # 0-based
+        cli_idx0 = header.index("Cliente")
         sta_idx0 = header.index("Status")
     except ValueError:
         cli_idx0, sta_idx0 = 0, 1  # fallback
@@ -179,6 +232,7 @@ def atualizar_status_clientes_batch(status_map_norm: dict) -> int:
     linhas = vals[1:]
     novos_status = []
     alterados = 0
+    mudancas = []
 
     for row in linhas:
         nome_raw = (row[cli_idx0] if cli_idx0 < len(row) else "").strip()
@@ -194,18 +248,20 @@ def atualizar_status_clientes_batch(status_map_norm: dict) -> int:
 
         if novo != atual:
             alterados += 1
+            mudancas.append({"cliente": nome_raw, "antes": atual or "-", "depois": novo})
         novos_status.append([novo])
 
     if alterados == 0:
-        return 0
+        return 0, []
 
+    # Escreve a coluna inteira de Status de uma vez
     col_letra = excel_col_letter(sta_idx0 + 1)  # idx 1-based
     inicio = 2
     fim = len(vals)
     rng = f"{col_letra}{inicio}:{col_letra}{fim}"
-
     ws.update(rng, novos_status, value_input_option="RAW")
-    return alterados
+
+    return alterados, mudancas
 
 # =============================
 # Execução
@@ -224,13 +280,17 @@ if "_status_auto_ok_fem" not in st.session_state:
 
 if not st.session_state["_status_auto_ok_fem"]:
     try:
-        # Base completa para cálculo do último atendimento (sem filtro de ano)
         df_full = df.copy()
         hoje = pd.Timestamp.today().normalize()
 
+        # último atendimento por cliente
         ultimos = df_full.groupby("Cliente")["Data"].max().reset_index()
         ultimos["DiasDesde"] = (hoje - ultimos["Data"]).dt.days
         ultimos["StatusNovo"] = ultimos["DiasDesde"].apply(lambda x: "Inativo" if x > 90 else "Ativo")
+
+        # dicionários auxiliares para legenda do card
+        last_date_map = dict(zip(ultimos["Cliente"], ultimos["Data"]))
+        days_map      = dict(zip(ultimos["Cliente"], ultimos["DiasDesde"]))
 
         # NÃO mexer nos "Ignorado"
         ignorados_set = set()
@@ -247,23 +307,57 @@ if not st.session_state["_status_auto_ok_fem"]:
             status_map_norm[norm(r["Cliente"])] = r["StatusNovo"]
 
         # aplica atualização em lote
-        alterados = atualizar_status_clientes_batch(status_map_norm)
+        alterados, mudancas = atualizar_status_clientes_batch(status_map_norm)
 
-        # se houve alteração, limpa caches e recarrega status
         if alterados > 0:
+            # limpa caches e recarrega status
             st.cache_data.clear()
             df_status = carregar_status_df()
             st.success(f"Status atualizado automaticamente ({alterados} linha(s) alterada(s)).")
+
+            # --- TELEGRAM: enviar CARD com foto para CADA mudança (ambas as direções) ---
+            for m in mudancas:
+                nome   = m["cliente"]
+                antes  = (m["antes"] or "-").strip()
+                depois = (m["depois"] or "-").strip()
+                foto   = foto_da_cliente(nome, df_status)
+
+                # infos extras
+                dt_ult = last_date_map.get(nome, pd.NaT)
+                dias   = days_map.get(nome, None)
+                if pd.isna(dt_ult) or dt_ult is pd.NaT:
+                    dt_txt = "—"
+                    dias_txt = "—"
+                else:
+                    dt_txt = pd.to_datetime(dt_ult).strftime("%d/%m/%Y")
+                    dias_txt = f"{int(dias)} dia(s)" if dias is not None else "—"
+
+                # ícone conforme direção
+                if antes.lower() == "inativo" and depois.lower() == "ativo":
+                    titulo = "✅ Reativada"
+                elif antes.lower() == "ativo" and depois.lower() == "inativo":
+                    titulo = "⛔️ Marcada como Inativa"
+                else:
+                    titulo = "🔁 Status atualizado"
+
+                legenda = (
+                    f"<b>{titulo}</b>\n"
+                    f"👤 <b>{nome}</b>\n"
+                    f"🪪 Status: <code>{antes}</code> → <b>{depois}</b>\n"
+                    f"🗓 Último atendimento: <b>{dt_txt}</b>\n"
+                    f"⏱ Dias desde o último: <b>{dias_txt}</b>\n"
+                    f"💈 Setor: <i>Feminino</i>"
+                )
+                tg_send_photo(foto, legenda)
+
         else:
             st.info("Status já estava atualizado (ou clientes marcados como 'Ignorado').")
 
-        # marca como concluído nesta sessão
         st.session_state["_status_auto_ok_fem"] = True
 
     except Exception as e:
         st.warning(f"Não foi possível atualizar status automaticamente agora: {e}")
-        # mesmo com erro, evita loop — marque como feito para não tentar a cada rerun
-        st.session_state["_status_auto_ok_fem"] = True
+        st.session_state["_status_auto_ok_fem"] = True  # evita loop
 
 # =============================
 # Filtro por Ano (mantém o ano atual e a última escolha)
