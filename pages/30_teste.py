@@ -1127,25 +1127,25 @@ else:
                 combo_cli = st.session_state.get(f"combo_{_keyify(cli)}", "")
 
                 # NOVO: opção de registro único também no lote
-                st.checkbox(f"{cli} - Registrar COMBO em UMA ÚNICA LINHA", value=True, key=f"ru_{_keyify(cli)}")
+st.checkbox(f"{cli} - Registrar COMBO em UMA ÚNICA LINHA", value=True, key=f"ru_{_keyify(cli)}")
 
-                if combo_cli:
-                    total_padrao = 0.0
-                    itens = []
-                    for s in combo_cli.split("+"):
-                        s_raw = s.strip()
-                        s_norm = _cap_first(s_raw)
-                        key_val = f"valor_{_keyify(cli)}_{_keyify(s_raw)}"
-                        val = st.number_input(
-                            f"{cli} - {s_norm} (padrão: R$ {obter_valor_servico(s_norm)})",
-                            value=float(obter_valor_servico(s_norm)),
-                            step=1.0, key=key_val
-                        )
-                        itens.append((s_raw, s_norm, val))
-                        total_padrao += float(val)
-                    st.caption(f"Total do combo de {cli} (bruto): {_fmt_brl(total_padrao)}")
+if combo_cli:
+    total_padrao = 0.0
+    itens = []
+    for s in combo_cli.split("+"):
+        s_raw = s.strip()
+        s_norm = _cap_first(s_raw)
+        key_val = f"valor_{_keyify(cli)}_{_keyify(s_raw)}"
+        val = st.number_input(
+            f"{cli} - {s_norm} (padrão: R$ {obter_valor_servico(s_norm)})",
+            value=float(obter_valor_servico(s_norm)),
+            step=1.0, key=key_val
+        )
+        itens.append((s_raw, s_norm, val))
+        total_padrao += float(val)
+    st.caption(f"Total do combo de {cli} (bruto): {_fmt_brl(total_padrao)}")
 
-                    if use_card_cli and not is_nao_cartao(st.session_state.get(f"conta_{_keyify(cli)}", "")):
+    if use_card_cli and not is_nao_cartao(st.session_state.get(f"conta_{_keyify(cli)}", "")):
                                                         st.selectbox(
                                     f"{cli} - Bandeira",
                                     ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"],
@@ -1176,44 +1176,73 @@ else:
                                     [nm for (r, nm, _) in itens],
                                     key=f"alvo_{_keyify(cli)}"
                                 )
+                                
             else:
                 # SIMPLES no modo LOTE
-                st.selectbox(f"Serviço simples para {cli}", servicos_existentes, key=f"servico_{_keyify(cli)}")
-                serv_cli = st.session_state.get(f"servico_{_keyify(cli)}", None)
+st.checkbox(f"{cli} - Registrar COMBO em UMA ÚNICA LINHA", value=True, key=f"ru_{_keyify(cli)}")
+
+if combo_cli:
+    # 1) Monta itens e total do combo
+    total_padrao = 0.0
+    itens = []
+    for s in combo_cli.split("+"):
+        s_raw = s.strip()
+        s_norm = _cap_first(s_raw)
+        key_val = f"valor_{_keyify(cli)}_{_keyify(s_raw)}"
+        val = st.number_input(
+            f"{cli} - {s_norm} (padrão: R$ {obter_valor_servico(s_norm)})",
+            value=float(obter_valor_servico(s_norm)),
+            step=1.0,
+            key=key_val
+        )
+        itens.append((s_raw, s_norm, float(val)))
+        total_padrao += float(val)
+
+    st.caption(f"Total do combo de {cli} (bruto): {_fmt_brl(total_padrao)}")
+
+    # 2) Bloco de cartão no lugar correto (após montar itens/total)
+    if use_card_cli and not is_nao_cartao(st.session_state.get(f"conta_{_keyify(cli)}", "")):
+        with st.expander(f"💳 {cli} - Pagamento no cartão (informe o LÍQUIDO recebido)", expanded=True):
+            c1, c2 = st.columns(2)
+            with c1:
                 st.number_input(
-                    f"{cli} - Valor do serviço",
-                    value=(obter_valor_servico(serv_cli) if serv_cli else 0.0),
+                    f"{cli} - Valor recebido (líquido)",
+                    value=float(total_padrao),
                     step=1.0,
-                    key=f"valor_{_keyify(cli)}_simples"
+                    key=f"liq_{_keyify(cli)}"
                 )
-                if use_card_cli and not is_nao_cartao(st.session_state.get(f"conta_{_keyify(cli)}", "")):
-                    with st.expander(f"💳 {cli} - Pagamento no cartão", expanded=True):
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.number_input(
-                                f"{cli} - Valor recebido (líquido)",
-                                value=float(st.session_state.get(f"valor_{_keyify(cli)}_simples", 0.0)),
-                                step=1.0,
-                                key=f"liq_{_keyify(cli)}"
-                            )
-                            st.selectbox(
-                                f"{cli} - Bandeira",
-                                ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"],
-                                index=0,
-                                key=f"bandeira_{_keyify(cli)}"
-                            )
-                        with c2:
-                            st.selectbox(
-                                f"{cli} - Tipo",
-                                ["Débito", "Crédito"],
-                                index=1,
-                                key=f"tipo_cartao_{_keyify(cli)}"
-                            )
-                            st.number_input(
-                                f"{cli} - Parcelas",
-                                min_value=1, max_value=12, value=1, step=1,
-                                key=f"parc_{_keyify(cli)}"
-                            )
+                st.selectbox(
+                    f"{cli} - Bandeira",
+                    ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"],
+                    index=0,
+                    key=f"bandeira_{_keyify(cli)}"
+                )
+            with c2:
+                st.selectbox(
+                    f"{cli} - Tipo",
+                    ["Débito", "Crédito"],
+                    index=1,
+                    key=f"tipo_cartao_{_keyify(cli)}"
+                )
+                st.number_input(
+                    f"{cli} - Parcelas",
+                    min_value=1, max_value=12, value=1, step=1,
+                    key=f"parc_{_keyify(cli)}"
+                )
+
+            st.radio(
+                f"{cli} - Distribuição do desconto/taxa",
+                ["Proporcional (padrão)", "Concentrar em um serviço"],
+                horizontal=False,
+                key=f"dist_{_keyify(cli)}"
+            )
+            if st.session_state.get(f"dist_{_keyify(cli)}", "Proporcional (padrão)") == "Concentrar em um serviço":
+                st.selectbox(
+                    f"{cli} - Aplicar TODO o desconto/taxa em",
+                    [nm for (r, nm, _) in itens],
+                    key=f"alvo_{_keyify(cli)}"
+                )
+
 
     if st.button("💾 Salvar TODOS atendimentos"):
         if not lista_final:
