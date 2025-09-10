@@ -1,125 +1,184 @@
+# 11_Adicionar_Atendimento.py — FEMININO (atualizado)
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import gspread
-from gspread_dataframe import get_as_dataframe
 from google.oauth2.service_account import Credentials
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from gspread.utils import rowcol_to_a1
+from datetime import datetime, date, timedelta
+import pytz
 import unicodedata
 import requests
+from collections import Counter
 
-st.set_page_config(layout="wide")
-st.title("🧍‍♀️ Clientes (Feminino) - Receita Total")
-
-# === CONFIG GOOGLE SHEETS ===
+# =========================
+# CONFIG
+# =========================
 SHEET_ID = "1qtOF1I7Ap4By2388ySThoVlZHbI3rAJv_haEcil0IUE"
 
-# Possíveis nomes das guias (variações)
-BASE_ALVOS = [
-    "base de dados feminino", "base de dados - feminino",
-    "base de dados (feminino)", "base de dados feminino "
+# >>> Abas FEMININO <<<
+ABA_DADOS = "Base de Dados Feminino"
+STATUS_ABA = "clientes_status_feminino"
+
+TZ = "America/Sao_Paulo"
+REL_MULT = 1.5
+DATA_FMT = "%d/%m/%Y"
+
+COLS_OFICIAIS = [
+    "Data", "Serviço", "Valor", "Conta", "Cliente", "Combo",
+    "Funcionário", "Fase", "Tipo", "Período"
 ]
-STATUS_ALVOS = [
-    "clientes_status_feminino", "clientes status feminino",
-    "clientes_status feminino", "status_feminino"
+COLS_FIADO = ["StatusFiado", "IDLancFiado", "VencimentoFiado", "DataPagamento"]
+# Extras para pagamento com cartão (gravamos também na Base)
+COLS_PAG_EXTRAS = [
+    "ValorBrutoRecebido", "ValorLiquidoRecebido",
+    "TaxaCartaoValor", "TaxaCartaoPct", "FormaPagDetalhe", "PagamentoID"
 ]
 
-# === TELEGRAM ===
-TG_TOKEN   = st.secrets["TELEGRAM"]["TOKEN"]
-TG_CHAT_ID = st.secrets["TELEGRAM"]["CHAT_ID"]
+# Funcionárias FEM (Meire primeiro por padrão)
+FUNCIONARIOS_FEM = ["Meire", "Daniela"]  # <<<<<<<<<<<<<< ordem ajustada
 
-# Logo padrão quando não existir foto da cliente
-LOGO_PADRAO = "https://res.cloudinary.com/db8ipmete/image/upload/v1752463905/Logo_sal%C3%A3o_kz9y9c.png"
+# =========================
+# TELEGRAM (IDs)
+# =========================
+TELEGRAM_TOKEN = "8257359388:AAGayJElTPT0pQadtamVf8LoL7R6EfWzFGE"
+TELEGRAM_CHAT_ID_JPAULO = "493747253"
+TELEGRAM_CHAT_ID_VINICIUS = "-1001234567890"
+TELEGRAM_CHAT_ID_FEMININO = "-1002965378062"  # Meire (canal feminino geral)
+TELEGRAM_CHAT_ID_DANIELA = "-1003039502089"   # Canal específico Daniela
 
-# -----------------------------
-# Utils
-# -----------------------------
-def norm(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
-    return " ".join(s.lower().strip().split())
 
-def parse_valor_qualquer(v):
-    """Converte 'R$ 1.234,56', '1.234,56', '25,00', '25.00', '25.0' ou número em float (sem inflar)."""
-    if pd.isna(v): return 0.0
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip().replace("\u00A0", "")
-    s = s.replace("R$", "").replace("r$", "").replace(" ", "")
-    tem_virg = "," in s
-    tem_ponto = "." in s
-    if tem_virg and tem_ponto:
-        s = s.replace(".", "").replace(",", ".")
-    elif tem_virg and not tem_ponto:
-        s = s.replace(",", ".")
+def _get_secret(name: str, default: str | None = None) -> str | None:
     try:
-        return float(s)
+        val = st.secrets.get(name)
+        val = (val or "").strip()
+        if val:
+            return val
     except Exception:
-        x = pd.to_numeric(s, errors="coerce")
-        return float(x) if pd.notna(x) else 0.0
+        pass
+    return (default or "").strip() or None
 
-def achar_col(df, nomes):
-    alvo = [n.strip().lower() for n in nomes]
-    for c in df.columns:
-        if c and c.strip().lower() in alvo:
-            return c
-    return None
 
-def find_worksheet(planilha, alvos_norm):
-    wss = planilha.worksheets()
-    titulos = [ws.title for ws in wss]
-    titulos_norm = [norm(t) for t in titulos]
-    # 1) match exato
-    for ws, tnorm in zip(wss, titulos_norm):
-        if tnorm in alvos_norm:
-            return ws
-    # 2) contém
-    for ws, tnorm in zip(wss, titulos_norm):
-        if any(a in tnorm for a in alvos_norm):
-            return ws
-    st.error("❌ Não encontrei a aba feminina. Guias disponíveis:\n- " + "\n- ".join(titulos))
-    st.stop()
+def _get_token() -> str | None:
+    return _get_secret("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
 
-def excel_col_letter(idx1_based: int) -> str:
-    s = ""
-    n = idx1_based
-    while n > 0:
-        n, r = divmod(n-1, 26)
-        s = chr(65 + r) + s
-    return s
 
-# --- Telegram helpers ---
-def tg_send(text: str, chat_id: str = None, parse_mode: str = "HTML"):
+def _get_chat_id_jp() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_JPAULO", TELEGRAM_CHAT_ID_JPAULO)
+
+
+def _get_chat_id_vini() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_VINICIUS", TELEGRAM_CHAT_ID_VINICIUS)
+
+
+def _get_chat_id_fem() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_FEMININO", TELEGRAM_CHAT_ID_FEMININO)
+
+
+def _get_chat_id_dani() -> str | None:
+    return _get_secret("TELEGRAM_CHAT_ID_DANIELA", TELEGRAM_CHAT_ID_DANIELA)
+
+
+def _check_tg_ready(token: str | None, chat_id: str | None) -> bool:
+    return bool((token or "").strip() and (chat_id or "").strip())
+
+
+def _chat_id_por_func(funcionario: str) -> str | None:
+    if funcionario == "Vinicius":
+        return _get_chat_id_vini()
+    if funcionario == "Daniela":
+        return _get_chat_id_dani()
+    if funcionario == "Meire":
+        return _get_chat_id_fem()
+    return _get_chat_id_jp()
+
+
+# =========================
+# UTILS
+# =========================
+def _norm(s: str) -> str:
+    s = (s or "").strip().casefold()
+    s = unicodedata.normalize("NFD", s)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+
+def _canon(s: str) -> str:
+    s = _norm(s)
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def _norm_key(s: str) -> str:
+    return unicodedata.normalize("NFKC", str(s).strip()).casefold()
+
+
+def _keyify(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    return "".join(ch if ch.isalnum() else "_" for ch in s.strip())
+
+
+def classificar_relative(dias, media):
+    if media is None:
+        return ("⚪ Sem média", "Sem média")
+    if dias <= media:
+        return ("🟢 Em dia", "Em dia")
+    elif dias <= media * REL_MULT:
+        return ("🟠 Pouco atrasado", "Pouco atrasado")
+    else:
+        return ("🔴 Muito atrasado", "Muito atrasado")
+
+
+def now_br():
+    return datetime.now(pytz.timezone(TZ)).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _cap_first(s: str) -> str:
+    return (str(s).strip().lower().capitalize()) if s is not None else ""
+
+
+def contains_cartao(s: str) -> bool:
+    MAQ = {
+        "cart", "cartao", "cartão", "credito", "crédito", "debito", "débito",
+        "maquina", "maquininha", "maquineta", "pos", "pagseguro", "mercadopago",
+        "mercado pago", "sumup", "stone", "cielo", "rede", "getnet", "safra",
+        "visa", "master", "elo", "hiper", "amex", "nubank", "nubank cnpj"
+    }
+    x = unicodedata.normalize("NFKD", (s or "")).encode("ascii", "ignore").decode("ascii")
+    x = x.lower().replace(" ", "")
+    return any(k in x for k in MAQ)
+
+
+def is_nao_cartao(conta: str) -> bool:
+    s = unicodedata.normalize("NFKD", (conta or "")).encode("ascii","ignore").decode("ascii").lower()
+    tokens = {"pix", "dinheiro", "carteira", "cash", "especie", "espécie", "transfer", "transferencia", "transferência", "ted", "doc", "fiado"}
+    return any(t in s for t in tokens)
+
+
+def default_card_flag(conta: str) -> bool:
+    if is_nao_cartao(conta):
+        return False
+    return contains_cartao(conta)
+
+
+def gerar_pag_id(prefixo="A"):
+    return f"{prefixo}-{datetime.now(pytz.timezone(TZ)).strftime('%Y%m%d%H%M%S%f')[:-3]}"
+
+
+def gerar_fiado_id(prefixo="F"):
+    return f"{prefixo}-{datetime.now(pytz.timezone(TZ)).strftime('%Y%m%d%H%M%S%f')[:-3]}"
+
+
+def _fmt_brl(v: float) -> str:
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = {
-            "chat_id": chat_id or TG_CHAT_ID,
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        requests.post(url, data=data, timeout=10)
-    except Exception as e:
-        st.warning(f"Falha ao enviar Telegram: {e}")
+        v = float(v)
+    except Exception:
+        v = 0.0
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def tg_send_photo(photo_url: str, caption: str, chat_id: str = None, parse_mode: str = "HTML"):
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
-        data = {
-            "chat_id": chat_id or TG_CHAT_ID,
-            "caption": caption[:1024],   # limite prático da legenda
-            "parse_mode": parse_mode
-        }
-        files = None
-        # envio simples com URL
-        data["photo"] = photo_url or LOGO_PADRAO
-        requests.post(url, data=data, files=files, timeout=15)
-    except Exception as e:
-        st.warning(f"Falha ao enviar foto no Telegram: {e}")
 
-# === Conexão ===
+# =========================
+# SHEETS
+# =========================
 @st.cache_resource
 def conectar_sheets():
     info = st.secrets["GCP_SERVICE_ACCOUNT"]
@@ -128,438 +187,1233 @@ def conectar_sheets():
     cliente = gspread.authorize(credenciais)
     return cliente.open_by_key(SHEET_ID)
 
-# === Carregar dados Feminino ===
-@st.cache_data(ttl=300)
-def carregar_dados():
-    planilha = conectar_sheets()
-    ws = find_worksheet(planilha, [norm(x) for x in BASE_ALVOS])
-    df = get_as_dataframe(ws).dropna(how="all")
-    df.columns = [col.strip() for col in df.columns]
 
-    if "Data" not in df.columns:
-        st.error("❌ Coluna 'Data' não encontrada na aba feminina."); st.stop()
-
-    df["Data"] = pd.to_datetime(df["Data"], errors="coerce", dayfirst=True)
-    df = df.dropna(subset=["Data"])
-    df["Ano"] = df["Data"].dt.year.astype(int)
-
-    col_serv = achar_col(df, ["Serviço", "Servico"])
-    if col_serv and col_serv != "Serviço":
-        df.rename(columns={col_serv: "Serviço"}, inplace=True)
-
-    col_valor = achar_col(df, ["Valor"])
-    if col_valor and col_valor != "Valor":
-        df.rename(columns={col_valor: "Valor"}, inplace=True)
-
-    col_conta = achar_col(df, ["Conta", "Forma de pagamento", "Pagamento", "Status"])
-    if col_conta and col_conta != "Conta":
-        df.rename(columns={col_conta: "Conta"}, inplace=True)
-
-    col_cli = achar_col(df, ["Cliente"])
-    if col_cli and col_cli != "Cliente":
-        df.rename(columns={col_cli: "Cliente"}, inplace=True)
-
-    df["Cliente"] = df["Cliente"].astype(str).str.strip()
-    df["ValorNum"] = df["Valor"].apply(parse_valor_qualquer)
-    return df
-
-@st.cache_data(ttl=300)
-def carregar_status_df():
-    """Lê a planilha de status (para indicadores e fotos)."""
+def ler_cabecalho(aba):
     try:
-        planilha = conectar_sheets()
-        ws = find_worksheet(planilha, [norm(x) for x in STATUS_ALVOS])
-        df = get_as_dataframe(ws).dropna(how="all")
-        df.columns = [c.strip() for c in df.columns]
-
-        # identificar colunas núcleo
-        col_cli = achar_col(df, ["Cliente"])
-        col_sta = achar_col(df, ["Status"])
-        if not col_cli or not col_sta:
-            out = pd.DataFrame(columns=["Cliente", "Status"])
-        else:
-            out = df[[col_cli, col_sta]].copy()
-            out.columns = ["Cliente", "Status"]
-
-        # tentar identificar coluna de foto/link
-        col_foto = achar_col(df, ["Foto", "Imagem", "Image", "URL", "Link", "FotoURL", "Foto Url", "Foto_Link"])
-        if col_foto:
-            out["FotoURL"] = df[col_foto].astype(str).fillna("").values
-        else:
-            out["FotoURL"] = ""
-
-        out["Cliente"] = out["Cliente"].astype(str).str.strip()
-        out["Status"]  = out["Status"].astype(str).str.strip()
-        return out
+        headers = aba.row_values(1)
+        return [h.strip() for h in headers] if headers else []
     except Exception:
-        return pd.DataFrame(columns=["Cliente", "Status", "FotoURL"])
+        return []
 
-def foto_da_cliente(nome: str, df_status: pd.DataFrame) -> str:
-    """Retorna URL da foto da cliente, se existir no status; senão, LOGO_PADRAO."""
-    if df_status is None or df_status.empty:
-        return LOGO_PADRAO
-    linha = df_status.loc[df_status["Cliente"].astype(str).str.strip() == str(nome).strip()]
-    if not linha.empty:
-        url = str(linha.iloc[0].get("FotoURL", "")).strip()
-        return url if url else LOGO_PADRAO
-    return LOGO_PADRAO
 
-def atualizar_status_clientes_batch(status_map_norm: dict):
-    """
-    Atualiza a coluna 'Status' da aba FEMININO em uma única chamada,
-    comparando clientes por nome normalizado (sem acento/caixa/espaços).
-    Não altera linhas cujo Status atual seja 'Ignorado' (case-insensitive).
+def _cmap(ws):
+    headers = ler_cabecalho(ws)
+    cmap = {}
+    for i, h in enumerate(headers):
+        k = _norm_key(h)
+        if k and k not in cmap:
+            cmap[k] = i + 1
+    return cmap
 
-    status_map_norm: { norm(nome_cliente) : "Ativo"/"Inativo" }
 
-    Retorna: (alterados:int, mudancas:list[dict]) onde cada item:
-        {"cliente": <str>, "antes": <str>, "depois": <str>}
-    """
-    planilha = conectar_sheets()
-    ws = find_worksheet(planilha, [norm(x) for x in STATUS_ALVOS])
+def format_extras_numeric(ws):
+    cmap = _cmap(ws)
 
-    vals = ws.get_all_values()
-    if not vals:
-        return 0, []
+    def fmt(name, ntype, pattern):
+        c = cmap.get(_norm_key(name))
+        if not c:
+            return
+        a1_from = rowcol_to_a1(2, c)
+        a1_to = rowcol_to_a1(50000, c)
+        try:
+            ws.format(f"{a1_from}:{a1_to}", {"numberFormat": {"type": ntype, "pattern": pattern}})
+        except Exception:
+            pass
 
-    header = [h.strip() for h in vals[0]]
+    fmt("ValorBrutoRecebido", "NUMBER", "0.00")
+    fmt("ValorLiquidoRecebido", "NUMBER", "0.00")
+    fmt("TaxaCartaoValor", "NUMBER", "0.00")
+    fmt("TaxaCartaoPct", "PERCENT", "0.00%")
+
+
+def carregar_base():
+    aba = conectar_sheets().worksheet(ABA_DADOS)
+    df = get_as_dataframe(aba).dropna(how="all")
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
+    for c in [*COLS_OFICIAIS, *COLS_FIADO, *COLS_PAG_EXTRAS]:
+        if c not in df.columns:
+            df[c] = ""
+    norm = {"manha": "Manhã", "Manha": "Manhã", "manha ": "Manhã", "tarde": "Tarde", "noite": "Noite"}
+    df["Período"] = df["Período"].astype(str).str.strip().replace(norm)
+    df.loc[~df["Período"].isin(["Manhã", "Tarde", "Noite"]), "Período"] = ""
+    df["Combo"] = df["Combo"].fillna("")
+    return df, aba
+
+
+def salvar_base(df_final: pd.DataFrame):
+    aba = conectar_sheets().worksheet(ABA_DADOS)
+    headers_existentes = ler_cabecalho(aba) or [*COLS_OFICIAIS, *COLS_FIADO, *COLS_PAG_EXTRAS]
+    colunas_alvo = list(dict.fromkeys([*headers_existentes, *COLS_OFICIAIS, *COLS_FIADO, *COLS_PAG_EXTRAS]))
+    for c in colunas_alvo:
+        if c not in df_final.columns:
+            df_final[c] = ""
+    df_final = df_final[colunas_alvo]
+    aba.clear()
+    set_with_dataframe(aba, df_final, include_index=False, include_column_header=True)
     try:
-        cli_idx0 = header.index("Cliente")
-        sta_idx0 = header.index("Status")
-    except ValueError:
-        cli_idx0, sta_idx0 = 0, 1  # fallback
+        format_extras_numeric(aba)
+    except Exception:
+        pass
 
-    linhas = vals[1:]
-    novos_status = []
-    alterados = 0
-    mudancas = []
 
-    for row in linhas:
-        nome_raw = (row[cli_idx0] if cli_idx0 < len(row) else "").strip()
-        atual    = (row[sta_idx0] if sta_idx0 < len(row) else "").strip()
+# =========================
+# FOTOS (status sheet)
+# =========================
+FOTO_COL_CANDIDATES = [
+    "link_foto","foto","imagem","url_foto","foto_link","link","image",
+    "foto url","foto_url","link da foto","url","foto (url)"
+]
 
-        # mantém "Ignorado"
-        if atual.lower() == "ignorado":
-            novos_status.append([atual])
-            continue
-
-        alvo_norm = norm(nome_raw)
-        novo = status_map_norm.get(alvo_norm, atual) or atual
-
-        if novo != atual:
-            alterados += 1
-            mudancas.append({"cliente": nome_raw, "antes": atual or "-", "depois": novo})
-        novos_status.append([novo])
-
-    if alterados == 0:
-        return 0, []
-
-    # Escreve a coluna inteira de Status de uma vez
-    col_letra = excel_col_letter(sta_idx0 + 1)  # idx 1-based
-    inicio = 2
-    fim = len(vals)
-    rng = f"{col_letra}{inicio}:{col_letra}{fim}"
-    ws.update(rng, novos_status, value_input_option="RAW")
-
-    return alterados, mudancas
-
-# =============================
-# Execução
-# =============================
-df = carregar_dados()
-df_status = carregar_status_df()
-
-# =============================
-# 🔄 Status automático (execução automática 1x por sessão)
-# =============================
-st.markdown("### 🔄 Status automático de clientes (90 dias)")
-
-# roda apenas 1x por sessão para evitar reprocesso/loops
-if "_status_auto_ok_fem" not in st.session_state:
-    st.session_state["_status_auto_ok_fem"] = False
-
-if not st.session_state["_status_auto_ok_fem"]:
+@st.cache_data(show_spinner=False, ttl=120)
+def carregar_fotos_mapa():
     try:
-        df_full = df.copy()
-        hoje = pd.Timestamp.today().normalize()
+        sh = conectar_sheets()
+        if STATUS_ABA not in [w.title for w in sh.worksheets()]:
+            return {}
+        ws = sh.worksheet(STATUS_ABA)
+        df = get_as_dataframe(ws).fillna("")
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
+        canon_map = {_canon(c): c for c in df.columns}
+        foto_col = None
+        for cand in FOTO_COL_CANDIDATES:
+            k = _canon(cand)
+            if k in canon_map:
+                foto_col = canon_map[k]; break
+        if not foto_col:
+            for c in df.columns:
+                cc = _canon(c)
+                if "foto" in cc and ("url" in cc or "link" in cc or "imagem" in cc or "image" in cc):
+                    foto_col = c; break
+        cli_col = None
+        for cand in ["cliente","nome","nome_cliente","cliente_nome","nome do cliente"]:
+            k = _canon(cand)
+            if k in canon_map:
+                cli_col = canon_map[k]; break
+        if not (foto_col and cli_col):
+            return {}
+        tmp = df[[cli_col, foto_col]].copy()
+        tmp.columns = ["Cliente", "Foto"]
+        tmp["k"] = tmp["Cliente"].astype(str).map(_norm)
+        return {r["k"]: str(r["Foto"]).strip() for _, r in tmp.iterrows() if str(r["Foto"]).strip()}
+    except Exception:
+        return {}
 
-        # último atendimento por cliente
-        ultimos = df_full.groupby("Cliente")["Data"].max().reset_index()
-        ultimos["DiasDesde"] = (hoje - ultimos["Data"]).dt.days
-        ultimos["StatusNovo"] = ultimos["DiasDesde"].apply(lambda x: "Inativo" if x > 90 else "Ativo")
 
-        # dicionários auxiliares para legenda do card
-        last_date_map = dict(zip(ultimos["Cliente"], ultimos["Data"]))
-        days_map      = dict(zip(ultimos["Cliente"], ultimos["DiasDesde"]))
+def get_foto_url(nome: str, force_refresh: bool = False) -> str | None:
+    if not nome:
+        return None
+    if force_refresh:
+        try:
+            carregar_fotos_mapa.clear()
+        except Exception:
+            pass
+    fotos = carregar_fotos_mapa()
+    url = fotos.get(_norm(nome))
+    return url if (url and url.strip()) else None
 
-        # NÃO mexer nos "Ignorado"
-        ignorados_set = set()
-        if not df_status.empty and "Status" in df_status.columns and "Cliente" in df_status.columns:
-            ignorados_set = set(
-                df_status.loc[df_status["Status"].str.lower().eq("ignorado"), "Cliente"].astype(str)
+
+# =========================
+# TELEGRAM – envio
+# =========================
+def tg_send(text: str, chat_id: str | None = None) -> bool:
+    token = _get_token()
+    chat = chat_id or _get_chat_id_jp()
+    if not _check_tg_ready(token, chat):
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=30)
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+        return bool(r.ok and js.get("ok"))
+    except Exception:
+        return False
+
+
+def tg_send_photo(photo_url: str, caption: str, chat_id: str | None = None) -> bool:
+    token = _get_token()
+    chat = chat_id or _get_chat_id_jp()
+    if not _check_tg_ready(token, chat):
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        payload = {"chat_id": chat, "photo": photo_url, "caption": caption, "parse_mode": "HTML"}
+        r = requests.post(url, data=payload, timeout=30)
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+        if r.ok and js.get("ok"):
+            return True
+        return tg_send(caption, chat_id=chat)
+    except Exception:
+        return tg_send(caption, chat_id=chat)
+
+
+# =========================
+# CARD – resumo/histórico + BLOCO CARTÃO
+# =========================
+def _resumo_do_dia(df_all: pd.DataFrame, cliente: str, data_str: str):
+    d = df_all[
+        (df_all["Cliente"].astype(str).str.strip() == cliente) &
+        (df_all["Data"].astype(str).str.strip() == data_str)
+    ].copy()
+    d["Valor"] = pd.to_numeric(d["Valor"], errors="coerce").fillna(0.0)
+    servicos = [str(s).strip() for s in d["Serviço"].fillna("").tolist() if str(s).strip()]
+    valor_total = float(d["Valor"].sum()) if not d.empty else 0.0
+    is_combo = len(servicos) > 1 or (d["Combo"].fillna("").str.strip() != "").any()
+
+    # Se registro único, Serviço vai ser a string do próprio combo, então len(servicos) = 1
+    if servicos:
+        if is_combo:
+            # se for registro único, o campo Serviço já vem como "corte + escova"
+            if len(servicos) == 1 and (d["Combo"].astype(str).str.strip() != "").any():
+                label = f"{servicos[0]} (Combo)"
+            else:
+                label = " + ".join(servicos) + " (Combo)"
+        else:
+            label = " + ".join(servicos) + " (Simples)"
+    else:
+        label = "-"
+
+    periodo_vals = [p for p in d["Período"].astype(str).str.strip().tolist() if p]
+    periodo_label = max(set(periodo_vals), key=periodo_vals.count) if periodo_vals else "-"
+
+    conta_vals = [p for p in d["Conta"].astype(str).str.strip().tolist() if p]
+    conta_label = max(set(conta_vals), key=conta_vals.count) if conta_vals else "-"
+
+    # Status de fiado (se existir)
+    fiado_status = "-"
+    if "StatusFiado" in d.columns:
+        s = d["StatusFiado"].astype(str).str.strip()
+        s = s[s != ""]
+        if not s.empty:
+            fiado_status = s.iloc[0]
+
+    venc = "-"
+    if "VencimentoFiado" in d.columns:
+        s = d["VencimentoFiado"].astype(str).str.strip()
+        s = s[s != ""]
+        if not s.empty:
+            venc = s.iloc[0]
+
+    return label, valor_total, is_combo, servicos, periodo_label, conta_label, fiado_status, venc
+
+
+def _ano_from_date_str(data_str: str) -> int | None:
+    dt = pd.to_datetime(data_str, format=DATA_FMT, errors="coerce")
+    return None if pd.isna(dt) else int(dt.year)
+
+
+def _year_sections_for_jpaulo(df_all: pd.DataFrame, cliente: str, ano: int) -> tuple[str, str]:
+    d = df_all.copy()
+    d = d[d["Cliente"].astype(str).str.strip() == cliente].copy()
+    d["_dt"] = pd.to_datetime(d["Data"], format=DATA_FMT, errors="coerce")
+    d = d.dropna(subset=["_dt"])
+    d["ano"] = d["_dt"].dt.year
+    d = d[d["ano"] == ano].copy()
+    if d.empty:
+        return (f"📚 <b>Histórico por ano</b>\n{ano}: R$ 0,00", f"🧾 <b>{ano}: por serviço</b>\n—")
+
+    d["Valor"] = pd.to_numeric(d["Valor"], errors="coerce").fillna(0.0)
+    total_ano = float(d["Valor"].sum())
+    sec_hist = "📚 <b>Histórico por ano</b>\n" + f"{ano}: <b>{_fmt_brl(total_ano)}</b>"
+
+    grp = (
+        d.dropna(subset=["Serviço"])
+         .assign(Serviço=lambda x: x["Serviço"].astype(str).str.strip())
+         .groupby("Serviço", as_index=False)
+         .agg(qtd=("Serviço", "count"), total=("Valor", "sum"))
+         .sort_values(["total", "qtd"], ascending=[False, False])
+    )
+    linhas_serv = [
+        f"{r['Serviço']}: <b>{int(r['qtd'])}×</b> • <b>{_fmt_brl(float(r['total']))}</b>"
+        for _, r in grp.iterrows()
+    ]
+    sec_serv = "🧾 <b>{}: por serviço</b>\n{}".format(ano, "\n".join(linhas_serv) if linhas_serv else "—")
+
+    freq_dias = Counter()
+    for dia, bloco in d.groupby(d["_dt"].dt.date):
+        func_most = (bloco["Funcionário"].astype(str).str.strip()
+                     .value_counts(dropna=False).idxmax() if not bloco.empty else "-")
+        if func_most in ["JPaulo", "Vinicius"] + FUNCIONARIOS_FEM:
+            freq_dias[func_most] += 1
+    if freq_dias:
+        ordem = ["JPaulo", "Vinicius"] + FUNCIONARIOS_FEM
+        linhas_func = [f"{f}: <b>{freq_dias.get(f,0)}</b> visita(s)" for f in ordem if f in freq_dias]
+        sec_serv += "\n\n👥 <b>Frequência por funcionário</b>\n" + "\n".join(linhas_func)
+
+    return sec_hist, sec_serv
+
+
+def _secao_pag_cartao(df_all: pd.DataFrame, cliente: str, data_str: str) -> str:
+    df = df_all[
+        (df_all["Cliente"].astype(str).str.strip() == cliente) &
+        (df_all["Data"].astype(str).str.strip() == data_str)
+    ].copy()
+    if df.empty:
+        return ""
+    df["_idx"] = df.index
+    com_pid = df[df["PagamentoID"].astype(str).str.strip() != ""].copy()
+    if com_pid.empty:
+        return ""
+    latest_row = com_pid.loc[com_pid["_idx"].idxmax()]
+    pid = str(latest_row["PagamentoID"]).strip()
+    bloco = df[df["PagamentoID"].astype(str).str.strip() == pid].copy()
+    bruto = pd.to_numeric(bloco.get("ValorBrutoRecebido", 0), errors="coerce").fillna(0).sum()
+    liqui = pd.to_numeric(bloco.get("ValorLiquidoRecebido", 0), errors="coerce").fillna(0).sum()
+    taxa_v = pd.to_numeric(bloco.get("TaxaCartaoValor", 0), errors="coerce").fillna(0).sum()
+    if liqui <= 0:
+        liqui = pd.to_numeric(bloco.get("Valor", 0), errors="coerce").fillna(0).sum()
+    taxa_pct = (taxa_v / bruto * 100.0) if bruto > 0 else 0.0
+
+    det = ""
+    if "FormaPagDetalhe" in bloco.columns:
+        s = bloco["FormaPagDetalhe"].astype(str).str.strip()
+        s = s[s != ""]
+        if not s.empty:
+            det = s.iloc[0]
+
+    conta = ""
+    if "Conta" in bloco.columns:
+        s2 = bloco["Conta"].astype(str).str.strip()
+        s2 = s2[s2 != ""]
+        if not s2.empty:
+            conta = s2.iloc[0]
+
+    linhas = [
+        "------------------------------",
+        "💳 <b>Pagamento no cartão</b>",
+        f"Forma: <b>{conta or '-'}</b>{(' · ' + det) if det else ''}",
+        f"Bruto: <b>{_fmt_brl(bruto)}</b> · Líquido: <b>{_fmt_brl(liqui)}</b>",
+        f"Taxa total: <b>{_fmt_brl(taxa_v)} ({taxa_pct:.2f}%)</b>",
+    ]
+    return "\n".join(linhas)
+
+
+def _secao_fiado(df_all: pd.DataFrame, cliente: str, data_str: str) -> str:
+    df = df_all[
+        (df_all["Cliente"].astype(str).str.strip() == cliente) &
+        (df_all["Data"].astype(str).str.strip() == data_str)
+    ].copy()
+    if df.empty:
+        return ""
+    if "StatusFiado" not in df.columns:
+        return ""
+    linha = df.iloc[-1]
+    status = str(linha.get("StatusFiado", "") or "").strip()
+    if not status:
+        return ""
+    venc = str(linha.get("VencimentoFiado", "") or "").strip() or "-"
+    pago_em = str(linha.get("DataPagamento", "") or "").strip() or "-"
+    idf = str(linha.get("IDLancFiado", "") or "").strip() or "-"
+    linhas = [
+        "------------------------------",
+        "🧾 <b>Fiado</b>",
+        f"Status: <b>{status}</b>",
+        f"Vencimento: <b>{venc}</b>",
+        f"Pagamento: <b>{pago_em}</b>",
+        f"ID: <b>{idf}</b>",
+    ]
+    return "\n".join(linhas)
+
+
+def make_card_caption_v2(
+    df_all, cliente, data_str, funcionario, servico_label, valor_total,
+    periodo_label, conta_label, pct_func: float | None = None, append_sections: list[str] | None = None
+):
+    d_hist = df_all[df_all["Cliente"].astype(str).str.strip() == cliente].copy()
+    d_hist["_dt"] = pd.to_datetime(d_hist["Data"], format=DATA_FMT, errors="coerce")
+    d_hist = d_hist.dropna(subset=["_dt"]).sort_values("_dt")
+    unique_days = sorted(set(d_hist["_dt"].dt.date.tolist()))
+    total_atend = len(unique_days)
+
+    valor_str = _fmt_brl(valor_total)
+    base = (
+        "📌 <b>Atendimento registrado</b>\n"
+        f"👤 Cliente: <b>{cliente}</b>\n"
+        f"🗓️ Data: <b>{data_str}</b>\n"
+        f"🕒 Período: <b>{periodo_label or '-'}</b>\n"
+        f"💳 Forma de pagamento: <b>{conta_label or '-'}</b>\n"
+        f"✂️ Serviço: <b>{servico_label}</b>\n"
+        f"💰 Valor total: <b>{valor_str}</b>\n"
+        f"👩‍🦰 Atendido por: <b>{funcionario}</b>\n"
+        f"📈 Total de atendimentos do cliente: <b>{total_atend}</b>"
+    )
+    if pct_func is not None:
+        valor_pct = (valor_total * (pct_func/100.0))
+        base += f"\n🧾 Comissão {funcionario} ({pct_func:.0f}%): <b>{_fmt_brl(valor_pct)}</b>"
+
+    if append_sections:
+        base += "\n\n" + "\n\n".join([s for s in append_sections if s and s.strip()])
+
+    return base
+
+
+def enviar_card(df_all, cliente, funcionario, data_str, servico=None, valor=None, combo=None, pct_func: float | None = None):
+    if servico is None or valor is None:
+        servico_label, valor_total, _, _, periodo_label, conta_label, fiado_status, venc = _resumo_do_dia(df_all, cliente, data_str)
+    else:
+        is_combo = bool(combo and str(combo).strip())
+        servico_label = (f"{servico} (Combo)" if is_combo and "+" in str(servico)
+                         else f"{servico} (Simples)" if not is_combo else f"{servico} (Combo)")
+        valor_total = float(valor)
+        _, _, _, _, periodo_label, conta_label, fiado_status, venc = _resumo_do_dia(df_all, cliente, data_str)
+
+    sec_cartao = _secao_pag_cartao(df_all, cliente, data_str)
+    sec_fiado = _secao_fiado(df_all, cliente, data_str)
+    extras_base = [s for s in [sec_cartao, sec_fiado] if s]
+
+    ano = _ano_from_date_str(data_str)
+    extras_jp = extras_base.copy()
+    if ano is not None:
+        sec_hist, sec_serv = _year_sections_for_jpaulo(df_all, cliente, ano)
+        extras_jp.extend([sec_hist, sec_serv])
+
+    foto = get_foto_url(cliente)  # pega a última foto cacheada
+
+    caption_base = make_card_caption_v2(
+        df_all, cliente, data_str, funcionario, servico_label, valor_total,
+        periodo_label, conta_label, pct_func=pct_func, append_sections=extras_base
+    )
+    caption_jp = make_card_caption_v2(
+        df_all, cliente, data_str, funcionario, servico_label, valor_total,
+        periodo_label, conta_label, pct_func=pct_func, append_sections=extras_jp
+    )
+
+    # Rotas:
+    # - Daniela: canal Daniela + JP
+    # - Meire: canal feminino + JP
+    # - Outros: destino padrão
+    if funcionario == "Daniela":
+        chat_d = _get_chat_id_dani()
+        if foto: tg_send_photo(foto, caption_base, chat_id=chat_d)
+        else:    tg_send(caption_base, chat_id=chat_d)
+        chat_jp = _get_chat_id_jp()
+        if foto: tg_send_photo(foto, caption_jp, chat_id=chat_jp)
+        else:    tg_send(caption_jp, chat_id=chat_jp)
+        return
+
+    if funcionario == "Meire":
+        chat_fem = _get_chat_id_fem()
+        if foto: tg_send_photo(foto, caption_base, chat_id=chat_fem)
+        else:    tg_send(caption_base, chat_id=chat_fem)
+        chat_jp = _get_chat_id_jp()
+        if foto: tg_send_photo(foto, caption_jp, chat_id=chat_jp)
+        else:    tg_send(caption_jp, chat_id=chat_jp)
+        return
+
+    destino = _chat_id_por_func(funcionario)
+    if foto: tg_send_photo(foto, caption_base, chat_id=destino)
+    else:    tg_send(caption_base, chat_id=destino)
+
+
+# =========================
+# VALORES DE SERVIÇO (exemplos)
+# =========================
+VALORES = {
+    "Corte": 35.0,
+    "Escova": 25.0,
+    "Unha mão": 25.0,
+    "Unha pé": 25.0,
+    "Sobrancelhas": 25.0,
+    "Designer de Henna": 30.0,
+    "Manicure": 25.0,
+    "Pedicure": 30.0,
+    "Progressiva": 150.0,
+    "Hidratação": 40.0
+}
+
+
+def obter_valor_servico(servico):
+    for k, v in VALORES.items():
+        if k.lower() == str(servico).lower():
+            return v
+    return 0.0
+
+
+def _preencher_fiado_vazio(linha: dict):
+    for c in [*COLS_FIADO, *COLS_PAG_EXTRAS]:
+        linha.setdefault(c, "")
+    return linha
+
+
+def ja_existe_atendimento(cliente, data, servico, combo=""):
+    df, _ = carregar_base()
+    df["Combo"] = df["Combo"].fillna("")
+    servico_norm = _cap_first(servico)
+    df_serv_norm = df["Serviço"].astype(str).map(_cap_first)
+    f = (
+        (df["Cliente"].astype(str).str.strip() == cliente) &
+        (df["Data"].astype(str).str.strip() == data) &
+        (df_serv_norm == servico_norm) &
+        (df["Combo"].astype(str).str.strip() == str(combo).strip())
+    )
+    return not df[f].empty
+
+
+def sugestoes_do_cliente(df_all, cli, conta_default, periodo_default, funcionario_default):
+    d = df_all[df_all["Cliente"].astype(str).str.strip() == cli].copy()
+    if d.empty:
+        return conta_default, periodo_default, funcionario_default
+    d["_dt"] = pd.to_datetime(d["Data"], format=DATA_FMT, errors="coerce")
+    d = d.dropna(subset=["_dt"]).sort_values("_dt")
+    if d.empty:
+        return conta_default, periodo_default, funcionario_default
+    ultima = d.iloc[-1]
+    conta = (ultima.get("Conta") or "").strip() or conta_default
+    periodo = (ultima.get("Período") or "").strip() or periodo_default
+    func = (ultima.get("Funcionário") or "").strip() or funcionario_default
+    if periodo not in ["Manhã", "Tarde", "Noite"]:
+        periodo = periodo_default
+    # força padronização: se não é Meire/Daniela, cai para Meire
+    if func not in FUNCIONARIOS_FEM + ["JPaulo", "Vinicius"]:
+        func = funcionario_default
+    # sempre prioriza Meire como default
+    if func not in FUNCIONARIOS_FEM:
+        func = FUNCIONARIOS_FEM[0]
+    return conta, periodo, func
+
+
+# =========================
+# UI – Cabeçalho
+# =========================
+st.set_page_config(layout="wide", page_title="Adicionar Atendimento (Feminino)", page_icon="💇‍♀️")
+st.title("📅 Adicionar Atendimento (Feminino)")
+
+# =========================
+# DADOS BASE PARA SUGESTÕES
+# =========================
+df_existente, _ = carregar_base()
+df_existente["_dt"] = pd.to_datetime(df_existente["Data"], format=DATA_FMT, errors="coerce")
+df_2025 = df_existente[df_existente["_dt"].dt.year == 2025]
+
+clientes_existentes = sorted(df_2025["Cliente"].dropna().unique())
+df_2025 = df_2025[df_2025["Serviço"].notna()].copy()
+servicos_existentes = sorted(df_2025["Serviço"].str.strip().unique())
+contas_existentes = sorted([c for c in df_2025["Conta"].dropna().astype(str).str.strip().unique() if c])
+combos_existentes = sorted([c for c in df_2025["Combo"].dropna().astype(str).str.strip().unique() if c])
+
+# =========================
+# FORM – Modo e Globais
+# =========================
+modo_lote = st.toggle("📦 Cadastro em Lote (vários clientes de uma vez)", value=False)
+
+# Data
+hoje_br = datetime.now(pytz.timezone(TZ)).date()
+data = st.date_input("Data", value=hoje_br).strftime("%d/%m/%Y")
+
+if modo_lote:
+    col1, col2 = st.columns(2)
+    with col1:
+        conta_global = st.selectbox(
+            "Forma de Pagamento (padrão/conta)",
+            list(dict.fromkeys(contas_existentes + ["Carteira", "Pix", "Transferência", "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago", "Fiado"]))
+        )
+    with col2:
+        # Meire vem padrão
+        funcionario_global = st.selectbox("Funcionário (padrão)", FUNCIONARIOS_FEM, index=0)
+    periodo_global = st.selectbox("Período do Atendimento (padrão)", ["Manhã", "Tarde", "Noite"])
+    tipo = st.selectbox("Tipo", ["Serviço", "Produto"])
+else:
+    conta_global = None
+    funcionario_global = None
+    periodo_global = None
+    tipo = "Serviço"
+
+fase = "Dono + funcionário"
+
+# =========================
+# MODO UM POR VEZ
+# =========================
+if not modo_lote:
+    # Nome + botão refresh
+    col_nome, col_refresh = st.columns([1, 0.25])
+    with col_nome:
+        cliente = st.selectbox("Nome do Cliente", clientes_existentes)
+    with col_refresh:
+        if st.button("🔄 Atualizar foto"):
+            carregar_fotos_mapa.clear()
+            st.toast("Fotos recarregadas.", icon="✅")
+            st.rerun()
+
+    novo_nome = st.text_input("Ou digite um novo nome de cliente")
+    cliente = novo_nome if novo_nome else cliente
+
+    # foto 200px
+    foto_url = get_foto_url(cliente)
+    if foto_url:
+        st.image(foto_url, caption=f"Imagem atual — {cliente}", width=200)
+    else:
+        st.caption("Sem foto cadastrada para este cliente.")
+
+    # Sugestões defaults (Meire primeiro)
+    conta_fallback = (contas_existentes[0] if contas_existentes else "Carteira")
+    periodo_fallback = "Manhã"
+    func_fallback = FUNCIONARIOS_FEM[0]  # Meire
+
+    sug_conta, sug_periodo, sug_func = sugestoes_do_cliente(
+        df_existente, cliente,
+        conta_global or conta_fallback,
+        periodo_global or periodo_fallback,
+        funcionario_global or func_fallback
+    )
+
+    conta = st.selectbox(
+        "Forma de Pagamento (Conta)",
+        list(dict.fromkeys([sug_conta] + contas_existentes + ["Carteira", "Pix", "Transferência", "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago", "Fiado"]))
+    )
+
+    # ===== FIADO embutido (igual Masculino) =====
+    usar_fiado = st.checkbox("🔖 Lançar como FIADO?", value=("fiado" in _norm(conta)))
+    if usar_fiado:
+        conta = "Fiado"  # força conta Fiado
+    venc_default = (hoje_br + timedelta(days=15)).strftime("%d/%m/%Y")
+    venc_fiado = st.text_input("Vencimento do Fiado (DD/MM/AAAA)", value=venc_default) if usar_fiado else ""
+
+    force_off = is_nao_cartao(conta) or usar_fiado
+    usar_cartao = st.checkbox(
+        "Tratar como cartão (com taxa)?",
+        value=(False if force_off else default_card_flag(conta)),
+        key="flag_card_um",
+        disabled=force_off,
+        help=("Desabilitado para PIX/Dinheiro/Transferência/Fiado." if force_off else None)
+    )
+
+    # Funcionário - Meire primeiro (index 0)
+    funcionario = st.selectbox(
+        "Funcionário", FUNCIONARIOS_FEM,
+        index=(FUNCIONARIOS_FEM.index(sug_func) if sug_func in FUNCIONARIOS_FEM else 0)
+    )
+
+    periodo_opcao = st.selectbox(
+        "Período do Atendimento", ["Manhã", "Tarde", "Noite"],
+        index=["Manhã", "Tarde", "Noite"].index(sug_periodo)
+    )
+
+    # Percentual da funcionária (só aparece para Daniela)
+    pct_func = None
+    if funcionario == "Daniela":
+        pct_func = st.number_input("Percentual da funcionária (Daniela) %", value=50.0, min_value=0.0, max_value=100.0, step=1.0)
+
+    ultimo = df_existente[df_existente["Cliente"] == cliente]
+    ultimo = ultimo.sort_values("Data", ascending=False).iloc[0] if not ultimo.empty else None
+
+    combo = ""
+    if ultimo is not None:
+        ult_combo = ultimo.get("Combo", "")
+        combo = st.selectbox("Combo (último primeiro)", [""] + list(dict.fromkeys([ult_combo] + combos_existentes)))
+
+    # ---------- COMBO ----------
+    if combo:
+        # NOVO: opção de REGISTRO ÚNICO (como no Masculino)
+        registro_unico = st.checkbox("🧩 Registrar COMBO em UMA ÚNICA LINHA", value=True, help="Se desmarcar, o combo será salvo expandido (1 linha por serviço).")
+        st.subheader("💰 Edite os valores do combo antes de salvar:")
+        valores_customizados = {}
+        for s in combo.split("+"):
+            s_raw = s.strip()
+            s_norm = _cap_first(s_raw)
+            valores_customizados[s_raw] = st.number_input(
+                f"{s_norm} (padrão: R$ {obter_valor_servico(s_norm)})",
+                value=float(obter_valor_servico(s_norm)),
+                step=1.0, key=f"valor_{_keyify(s_raw)}"
+            )
+        total_bruto_combo = float(sum(valores_customizados.values()))
+        st.caption(f"Total do combo (bruto): {_fmt_brl(total_bruto_combo)}")
+
+        # cartão (opcional) – desativado se Fiado
+        liquido_total = None
+        bandeira = ""
+        tipo_cartao = "Crédito"
+        parcelas = 1
+        dist_modo = "Proporcional (padrão)"
+        alvo_servico = None
+
+        if usar_cartao and not is_nao_cartao(conta):
+            with st.expander("💳 Pagamento no cartão (informe o LÍQUIDO recebido)", expanded=True):
+                c1, c2 = st.columns(2)
+                with c1:
+                    liquido_total = st.number_input("Valor recebido (líquido)", value=total_bruto_combo, step=1.0, format="%.2f")
+                    bandeira = st.selectbox("Bandeira", ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"], index=0)
+                with c2:
+                    tipo_cartao = st.selectbox("Tipo", ["Débito", "Crédito"], index=1)
+                    parcelas = st.number_input("Parcelas (se crédito)", min_value=1, max_value=12, value=1, step=1)
+                dist_modo = st.radio("Distribuição do desconto/taxa", ["Proporcional (padrão)", "Concentrar em um serviço"], horizontal=False)
+                if dist_modo == "Concentrar em um serviço":
+                    alvo_servico = st.selectbox("Aplicar TODO o desconto/taxa em", list(valores_customizados.keys()))
+
+                taxa_val = max(0.0, total_bruto_combo - float(liquido_total or 0.0))
+                taxa_pct = (taxa_val / total_bruto_combo * 100.0) if total_bruto_combo > 0 else 0.0
+                st.caption(f"Taxa estimada: {_fmt_brl(taxa_val)} ({taxa_pct:.2f}%)")
+
+        if "combo_salvo" not in st.session_state:
+            st.session_state.combo_salvo = False
+
+        if not st.session_state.combo_salvo and st.button("✅ Confirmar e Salvar Combo"):
+            duplicado = any(ja_existe_atendimento(cliente, data, _cap_first(s), combo) for s in combo.split("+"))
+            if not registro_unico and duplicado:
+                st.warning("⚠️ Combo já registrado para este cliente e data.")
+            else:
+                df_all, _ = carregar_base()
+                novas = []
+                usar_cartao_efetivo = (usar_cartao and not is_nao_cartao(conta) and not usar_fiado)
+
+                # ====== REGISTRO ÚNICO ======
+                if registro_unico:
+                    serv_label = combo.replace("+", " + ").strip()
+                    bruto_total = float(total_bruto_combo)
+                    if usar_fiado:
+                        # Fiado: sem taxas, conta=Fiado, status aberto
+                        nova = _preencher_fiado_vazio({
+                            "Data": data, "Serviço": serv_label, "Valor": bruto_total, "Conta": "Fiado",
+                            "Cliente": cliente, "Combo": combo, "Funcionário": funcionario, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_opcao,
+                            "StatusFiado": "Em aberto",
+                            "IDLancFiado": gerar_fiado_id("F"),
+                            "VencimentoFiado": venc_fiado,
+                            "DataPagamento": ""
+                        })
+                        novas.append(nova)
+                    elif usar_cartao_efetivo:
+                        id_pag = gerar_pag_id("A")
+                        liq = float(liquido_total or 0.0)
+                        taxa_v = round(max(0.0, bruto_total - liq), 2)
+                        taxa_pct = round((taxa_v / bruto_total * 100.0), 4) if bruto_total > 0 else 0.0
+                        nova = _preencher_fiado_vazio({
+                            "Data": data, "Serviço": serv_label, "Valor": liq, "Conta": conta,
+                            "Cliente": cliente, "Combo": combo, "Funcionário": funcionario, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_opcao,
+                            "ValorBrutoRecebido": bruto_total, "ValorLiquidoRecebido": liq,
+                            "TaxaCartaoValor": taxa_v, "TaxaCartaoPct": taxa_pct,
+                            "FormaPagDetalhe": f"{bandeira or '-'} | {tipo_cartao} | {int(parcelas)}x",
+                            "PagamentoID": id_pag
+                        })
+                        novas.append(nova)
+                    else:
+                        # pagamento normal (pix/dinheiro/transfer)
+                        nova = _preencher_fiado_vazio({
+                            "Data": data, "Serviço": serv_label, "Valor": bruto_total, "Conta": conta,
+                            "Cliente": cliente, "Combo": combo, "Funcionário": funcionario, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_opcao
+                        })
+                        novas.append(nova)
+
+                # ====== EXPANDIDO (uma linha por serviço) ======
+                else:
+                    id_pag = gerar_pag_id("A") if usar_cartao_efetivo else ""
+                    soma_outros = None
+                    if usar_cartao_efetivo and dist_modo == "Concentrar em um serviço" and alvo_servico:
+                        soma_outros = sum(v for k, v in valores_customizados.items() if k != alvo_servico)
+
+                    for s in combo.split("+"):
+                        s_raw = s.strip()
+                        s_norm = _cap_first(s_raw)
+                        bruto_i = float(valores_customizados.get(s_raw, obter_valor_servico(s_norm)))
+
+                        if usar_fiado:
+                            extras = {
+                                "StatusFiado": "Em aberto",
+                                "IDLancFiado": gerar_fiado_id("F"),
+                                "VencimentoFiado": venc_fiado,
+                                "DataPagamento": ""
+                            }
+                            valor_para_base = bruto_i
+                        elif usar_cartao_efetivo and total_bruto_combo > 0:
+                            if dist_modo == "Concentrar em um serviço" and alvo_servico:
+                                if s_raw == alvo_servico:
+                                    liq_i = float(liquido_total or 0.0) - float(soma_outros or 0.0)
+                                    liq_i = round(max(0.0, liq_i), 2)
+                                else:
+                                    liq_i = round(bruto_i, 2)
+                            else:
+                                liq_i = round(float(liquido_total or 0.0) * (bruto_i / total_bruto_combo), 2)
+                            taxa_i = round(bruto_i - liq_i, 2)
+                            taxa_pct_i = (taxa_i / bruto_i * 100.0) if bruto_i > 0 else 0.0
+                            valor_para_base = liq_i
+                            extras = {
+                                "ValorBrutoRecebido": bruto_i, "ValorLiquidoRecebido": liq_i,
+                                "TaxaCartaoValor": taxa_i, "TaxaCartaoPct": round(taxa_pct_i, 4),
+                                "FormaPagDetalhe": f"{bandeira or '-'} | {tipo_cartao} | {int(parcelas)}x",
+                                "PagamentoID": id_pag
+                            }
+                        else:
+                            valor_para_base = bruto_i
+                            extras = {}
+
+                        linha = _preencher_fiado_vazio({
+                            "Data": data, "Serviço": s_norm, "Valor": valor_para_base, "Conta": conta if not usar_fiado else "Fiado",
+                            "Cliente": cliente, "Combo": combo, "Funcionário": funcionario, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_opcao, **extras
+                        })
+                        novas.append(linha)
+
+                    # ajuste de centavos no expandido com cartão
+                    if usar_cartao_efetivo and novas:
+                        soma_liq = sum(float(n.get("Valor", 0) or 0) for n in novas)
+                        delta = round(float(liquido_total or 0.0) - soma_liq, 2)
+                        if abs(delta) >= 0.01:
+                            idx_ajuste = len(novas) - 1
+                            if dist_modo == "Concentrar em um serviço" and alvo_servico:
+                                for i, n in enumerate(novas):
+                                    if _norm_key(n.get("Serviço","")) == _norm_key(_cap_first(alvo_servico)):
+                                        idx_ajuste = i; break
+                            novas[idx_ajuste]["Valor"] = float(novas[idx_ajuste]["Valor"]) + delta
+                            bsel = float(novas[idx_ajuste].get("ValorBrutoRecebido", 0) or 0)
+                            lsel = float(novas[idx_ajuste]["Valor"])
+                            tsel = round(bsel - lsel, 2)
+                            psel = (tsel / bsel * 100.0) if bsel > 0 else 0.0
+                            novas[idx_ajuste]["ValorLiquidoRecebido"] = lsel
+                            novas[idx_ajuste]["TaxaCartaoValor"] = tsel
+                            novas[idx_ajuste]["TaxaCartaoPct"] = round(psel, 4)
+
+                df_final = pd.concat([df_all, pd.DataFrame(novas)], ignore_index=True)
+                salvar_base(df_final)
+                st.session_state.combo_salvo = True
+                st.success(f"✅ Atendimento salvo com sucesso para {cliente} no dia {data}.")
+
+                # card
+                valor_card = sum(float(n["Valor"]) for n in novas)
+                enviar_card(
+                    df_final, cliente, funcionario, data,
+                    servico=(combo.replace("+", " + ") if registro_unico else combo.replace("+", " + ")),
+                    valor=valor_card, combo=combo,
+                    pct_func=pct_func if funcionario == "Daniela" else None
+                )
+
+    # ---------- SIMPLES ----------
+    else:
+        st.subheader("✂️ Selecione o serviço e valor:")
+        servico = st.selectbox("Serviço", servicos_existentes)
+        valor = st.number_input("Valor", value=obter_valor_servico(servico), step=1.0)
+
+        def bloco_cartao_ui(total_bruto_padrao: float):
+            with st.expander("💳 Pagamento no cartão (informe o LÍQUIDO recebido)", expanded=True):
+                c1, c2 = st.columns(2)
+                with c1:
+                    liquido = st.number_input("Valor recebido (líquido)", value=float(total_bruto_padrao), step=1.0, format="%.2f")
+                    bandeira = st.selectbox("Bandeira", ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"], index=0)
+                with c2:
+                    tipo_cartao = st.selectbox("Tipo", ["Débito", "Crédito"], index=1)
+                    parcelas = st.number_input("Parcelas (se crédito)", min_value=1, max_value=12, value=1, step=1)
+                taxa_val = max(0.0, float(total_bruto_padrao) - float(liquido or 0.0))
+                taxa_pct = (taxa_val / float(total_bruto_padrao) * 100.0) if total_bruto_padrao > 0 else 0.0
+                st.caption(f"Taxa estimada: {_fmt_brl(taxa_val)} ({taxa_pct:.2f}%)")
+                return float(liquido or 0.0), str(bandeira), str(tipo_cartao), int(parcelas)
+
+        if usar_cartao and not is_nao_cartao(conta) and not usar_fiado:
+            liquido_total, bandeira, tipo_cartao, parcelas = bloco_cartao_ui(valor)
+        else:
+            liquido_total, bandeira, tipo_cartao, parcelas = None, "", "Crédito", 1
+
+        if "simples_salvo" not in st.session_state:
+            st.session_state.simples_salvo = False
+
+        if not st.session_state.simples_salvo and st.button("📁 Salvar Atendimento"):
+            servico_norm = _cap_first(servico)
+            if ja_existe_atendimento(cliente, data, servico_norm):
+                st.warning("⚠️ Atendimento já registrado para este cliente, data e serviço.")
+            else:
+                df_all, _ = carregar_base()
+
+                if usar_fiado:
+                    # Fiado simples
+                    nova = _preencher_fiado_vazio({
+                        "Data": data, "Serviço": servico_norm, "Valor": float(valor), "Conta": "Fiado",
+                        "Cliente": cliente, "Combo": "", "Funcionário": funcionario, "Fase": fase,
+                        "Tipo": tipo, "Período": periodo_opcao,
+                        "StatusFiado": "Em aberto",
+                        "IDLancFiado": gerar_fiado_id("F"),
+                        "VencimentoFiado": venc_fiado,
+                        "DataPagamento": ""
+                    })
+                else:
+                    usar_cartao_efetivo = usar_cartao and not is_nao_cartao(conta)
+                    if usar_cartao_efetivo:
+                        id_pag = gerar_pag_id("A")
+                        bruto = float(valor)
+                        liq = float(liquido_total or 0.0)
+                        taxa_v = round(max(0.0, bruto - liq), 2)
+                        taxa_pct = round((taxa_v / bruto * 100.0), 4) if bruto > 0 else 0.0
+                        nova = _preencher_fiado_vazio({
+                            "Data": data, "Serviço": servico_norm, "Valor": liq, "Conta": conta,
+                            "Cliente": cliente, "Combo": "", "Funcionário": funcionario, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_opcao,
+                            "ValorBrutoRecebido": bruto, "ValorLiquidoRecebido": liq,
+                            "TaxaCartaoValor": taxa_v, "TaxaCartaoPct": taxa_pct,
+                            "FormaPagDetalhe": f"{bandeira or '-'} | {tipo_cartao} | {int(parcelas)}x",
+                            "PagamentoID": id_pag
+                        })
+                    else:
+                        nova = _preencher_fiado_vazio({
+                            "Data": data, "Serviço": servico_norm, "Valor": float(valor), "Conta": conta,
+                            "Cliente": cliente, "Combo": "", "Funcionário": funcionario, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_opcao
+                        })
+
+                df_final = pd.concat([df_all, pd.DataFrame([nova])], ignore_index=True)
+                salvar_base(df_final)
+                st.session_state.simples_salvo = True
+                st.success(f"✅ Atendimento salvo com sucesso para {cliente} no dia {data}.")
+
+                enviar_card(
+                    df_final, cliente, funcionario, data,
+                    servico=servico_norm, valor=float(nova["Valor"]), combo="",
+                    pct_func=pct_func if funcionario == "Daniela" else None
+                )
+
+# =========================
+# MODO LOTE
+# =========================
+else:
+    st.info("Defina atendimento individual por cliente (misture combos e simples). Escolha forma de pagamento, período e funcionário para cada um.")
+    clientes_multi = st.multiselect("Clientes existentes", clientes_existentes)
+    novos_nomes_raw = st.text_area("Ou cole novos nomes (um por linha)", value="")
+    novos_nomes = [n.strip() for n in novos_nomes_raw.splitlines() if n.strip()]
+    lista_final = list(dict.fromkeys(clientes_multi + novos_nomes))
+    st.write(f"Total selecionados: **{len(lista_final)}**")
+
+    enviar_cards = st.checkbox("Enviar card no Telegram após salvar", value=True)
+
+    for cli in lista_final:
+        with st.container(border=True):
+            st.subheader(f"⚙️ Atendimento para {cli}")
+            # foto do cliente (200px) se houver
+            f_url = get_foto_url(cli)
+            if f_url:
+                st.image(f_url, width=200, caption=cli)
+
+            sug_conta, sug_periodo, sug_func = sugestoes_do_cliente(
+                df_existente, cli, conta_global or "Carteira", periodo_global or "Manhã", funcionario_global or FUNCIONARIOS_FEM[0]
             )
 
-        # mapa normalizado (pula ignorados)
-        status_map_norm = {}
-        for _, r in ultimos.iterrows():
-            if r["Cliente"] in ignorados_set:
-                continue
-            status_map_norm[norm(r["Cliente"])] = r["StatusNovo"]
+            tipo_at = st.radio(f"Tipo de atendimento para {cli}", ["Simples", "Combo"], horizontal=True, key=f"tipo_{_keyify(cli)}")
 
-        # aplica atualização em lote
-        alterados, mudancas = atualizar_status_clientes_batch(status_map_norm)
+            st.selectbox(
+                f"Forma de Pagamento de {cli}",
+                list(dict.fromkeys([sug_conta] + contas_existentes + ["Carteira", "Pix", "Transferência", "Nubank CNPJ", "Nubank", "Pagseguro", "Mercado Pago", "Fiado"])),
+                key=f"conta_{_keyify(cli)}"
+            )
 
-        if alterados > 0:
-            # limpa caches e recarrega status
-            st.cache_data.clear()
-            df_status = carregar_status_df()
-            st.success(f"Status atualizado automaticamente ({alterados} linha(s) alterada(s)).")
+            # FIADO por cliente (lote)
+            usar_fiado_cli = st.checkbox(f"{cli} - Lançar como FIADO?", value=("fiado" in _norm(st.session_state.get(f"conta_{_keyify(cli)}",""))), key=f"fiado_{_keyify(cli)}")
+            if usar_fiado_cli:
+                st.session_state[f"conta_{_keyify(cli)}"] = "Fiado"
+            venc_default_cli = (hoje_br + timedelta(days=15)).strftime("%d/%m/%Y")
+            st.text_input(f"{cli} - Vencimento do Fiado (DD/MM/AAAA)", value=venc_default_cli, key=f"venc_{_keyify(cli)}") if usar_fiado_cli else None
 
-            # --- TELEGRAM: enviar CARD com foto para CADA mudança (ambas as direções) ---
-            for m in mudancas:
-                nome   = m["cliente"]
-                antes  = (m["antes"] or "-").strip()
-                depois = (m["depois"] or "-").strip()
-                foto   = foto_da_cliente(nome, df_status)
+            force_off_cli = is_nao_cartao(st.session_state.get(f"conta_{_keyify(cli)}", "")) or usar_fiado_cli
+            st.checkbox(
+                f"{cli} - Tratar como cartão (com taxa)?",
+                value=(False if force_off_cli else default_card_flag(st.session_state.get(f"conta_{_keyify(cli)}", ""))),
+                key=f"flag_card_{_keyify(cli)}",
+                disabled=force_off_cli,
+                help=("Desabilitado para PIX/Dinheiro/Transferência/Fiado." if force_off_cli else None),
+            )
+            use_card_cli = (not force_off_cli) and bool(st.session_state.get(f"flag_card_{_keyify(cli)}", False))
 
-                # infos extras
-                dt_ult = last_date_map.get(nome, pd.NaT)
-                dias   = days_map.get(nome, None)
-                if pd.isna(dt_ult) or dt_ult is pd.NaT:
-                    dt_txt = "—"
-                    dias_txt = "—"
-                else:
-                    dt_txt = pd.to_datetime(dt_ult).strftime("%d/%m/%Y")
-                    dias_txt = f"{int(dias)} dia(s)" if dias is not None else "—"
+            st.selectbox(f"Período do Atendimento de {cli}", ["Manhã", "Tarde", "Noite"],
+                         index=["Manhã","Tarde","Noite"].index(sug_periodo), key=f"periodo_{_keyify(cli)}")
 
-                # ícone conforme direção
-                if antes.lower() == "inativo" and depois.lower() == "ativo":
-                    titulo = "✅ Reativada"
-                elif antes.lower() == "ativo" and depois.lower() == "inativo":
-                    titulo = "⛔️ Marcada como Inativa"
-                else:
-                    titulo = "🔁 Status atualizado"
+            # Funcionário: Meire vem primeiro por padrão
+            st.selectbox(f"Funcionário de {cli}", FUNCIONARIOS_FEM,
+                         index=(FUNCIONARIOS_FEM.index(sug_func) if sug_func in FUNCIONARIOS_FEM else 0),
+                         key=f"func_{_keyify(cli)}")
 
-                legenda = (
-                    f"<b>{titulo}</b>\n"
-                    f"👤 <b>{nome}</b>\n"
-                    f"🪪 Status: <code>{antes}</code> → <b>{depois}</b>\n"
-                    f"🗓 Último atendimento: <b>{dt_txt}</b>\n"
-                    f"⏱ Dias desde o último: <b>{dias_txt}</b>\n"
-                    f"💈 Setor: <i>Feminino</i>"
+            # Percentual quando Daniela
+            if st.session_state.get(f"func_{_keyify(cli)}", FUNCIONARIOS_FEM[0]) == "Daniela":
+                st.number_input(f"{cli} - Percentual da Daniela (%)", value=50.0, min_value=0.0, max_value=100.0, step=1.0, key=f"pct_{_keyify(cli)}")
+
+            if tipo_at == "Combo":
+                st.selectbox(f"Combo para {cli} (formato corte+escova, etc.)", [""] + combos_existentes, key=f"combo_{_keyify(cli)}")
+                combo_cli = st.session_state.get(f"combo_{_keyify(cli)}", "")
+
+                # NOVO: opção de registro único também no lote
+                st.checkbox(f"{cli} - Registrar COMBO em UMA ÚNICA LINHA", value=True, key=f"ru_{_keyify(cli)}")
+
+                if combo_cli:
+                    total_padrao = 0.0
+                    itens = []
+                    for s in combo_cli.split("+"):
+                        s_raw = s.strip()
+                        s_norm = _cap_first(s_raw)
+                        key_val = f"valor_{_keyify(cli)}_{_keyify(s_raw)}"
+                        val = st.number_input(
+                            f"{cli} - {s_norm} (padrão: R$ {obter_valor_servico(s_norm)})",
+                            value=float(obter_valor_servico(s_norm)),
+                            step=1.0, key=key_val
+                        )
+                        itens.append((s_raw, s_norm, val))
+                        total_padrao += float(val)
+                    st.caption(f"Total do combo de {cli} (bruto): {_fmt_brl(total_padrao)}")
+
+                    if use_card_cli and not is_nao_cartao(st.session_state.get(f"conta_{_keyify(cli)}", "")):
+                                                        st.selectbox(
+                                    f"{cli} - Bandeira",
+                                    ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"],
+                                    index=0,
+                                    key=f"bandeira_{_keyify(cli)}"
+                                )
+                            with c2:
+                                st.selectbox(
+                                    f"{cli} - Tipo",
+                                    ["Débito", "Crédito"],
+                                    index=1,
+                                    key=f"tipo_cartao_{_keyify(cli)}"
+                                )
+                                st.number_input(
+                                    f"{cli} - Parcelas",
+                                    min_value=1, max_value=12, value=1, step=1,
+                                    key=f"parc_{_keyify(cli)}"
+                                )
+                            st.radio(
+                                f"{cli} - Distribuição do desconto/taxa",
+                                ["Proporcional (padrão)", "Concentrar em um serviço"],
+                                horizontal=False,
+                                key=f"dist_{_keyify(cli)}"
+                            )
+                            if st.session_state.get(f"dist_{_keyify(cli)}", "Proporcional (padrão)") == "Concentrar em um serviço":
+                                st.selectbox(
+                                    f"{cli} - Aplicar TODO o desconto/taxa em",
+                                    [nm for (r, nm, _) in itens],
+                                    key=f"alvo_{_keyify(cli)}"
+                                )
+            else:
+                # SIMPLES no modo LOTE
+                st.selectbox(f"Serviço simples para {cli}", servicos_existentes, key=f"servico_{_keyify(cli)}")
+                serv_cli = st.session_state.get(f"servico_{_keyify(cli)}", None)
+                st.number_input(
+                    f"{cli} - Valor do serviço",
+                    value=(obter_valor_servico(serv_cli) if serv_cli else 0.0),
+                    step=1.0,
+                    key=f"valor_{_keyify(cli)}_simples"
                 )
-                tg_send_photo(foto, legenda)
+                if use_card_cli and not is_nao_cartao(st.session_state.get(f"conta_{_keyify(cli)}", "")):
+                    with st.expander(f"💳 {cli} - Pagamento no cartão", expanded=True):
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.number_input(
+                                f"{cli} - Valor recebido (líquido)",
+                                value=float(st.session_state.get(f"valor_{_keyify(cli)}_simples", 0.0)),
+                                step=1.0,
+                                key=f"liq_{_keyify(cli)}"
+                            )
+                            st.selectbox(
+                                f"{cli} - Bandeira",
+                                ["", "Visa", "Mastercard", "Maestro", "Elo", "Hipercard", "Amex", "Outros"],
+                                index=0,
+                                key=f"bandeira_{_keyify(cli)}"
+                            )
+                        with c2:
+                            st.selectbox(
+                                f"{cli} - Tipo",
+                                ["Débito", "Crédito"],
+                                index=1,
+                                key=f"tipo_cartao_{_keyify(cli)}"
+                            )
+                            st.number_input(
+                                f"{cli} - Parcelas",
+                                min_value=1, max_value=12, value=1, step=1,
+                                key=f"parc_{_keyify(cli)}"
+                            )
 
+    if st.button("💾 Salvar TODOS atendimentos"):
+        if not lista_final:
+            st.warning("Selecione ou informe ao menos um cliente.")
         else:
-            st.info("Status já estava atualizado (ou clientes marcados como 'Ignorado').")
+            df_all, _ = carregar_base()
+            novas, clientes_salvos = [], set()
+            funcionario_por_cliente = {}
+            pct_por_cliente = {}
 
-        st.session_state["_status_auto_ok_fem"] = True
+            for cli in lista_final:
+                tipo_at = st.session_state.get(f"tipo_{_keyify(cli)}", "Simples")
+                conta_cli = st.session_state.get(f"conta_{_keyify(cli)}", conta_global or "Carteira")
+                usar_fiado_cli = bool(st.session_state.get(f"fiado_{_keyify(cli)}", False))
+                use_card_cli = bool(st.session_state.get(f"flag_card_{_keyify(cli)}", False)) and not is_nao_cartao(conta_cli) and not usar_fiado_cli
+                periodo_cli = st.session_state.get(f"periodo_{_keyify(cli)}", periodo_global or "Manhã")
+                func_cli = st.session_state.get(f"func_{_keyify(cli)}", funcionario_global or FUNCIONARIOS_FEM[0])
+                if func_cli == "Daniela":
+                    pct_por_cliente[cli] = float(st.session_state.get(f"pct_{_keyify(cli)}", 50.0))
 
-    except Exception as e:
-        st.warning(f"Não foi possível atualizar status automaticamente agora: {e}")
-        st.session_state["_status_auto_ok_fem"] = True  # evita loop
+                if tipo_at == "Combo":
+                    combo_cli = st.session_state.get(f"combo_{_keyify(cli)}", "")
+                    if not combo_cli:
+                        st.warning(f"⚠️ {cli}: combo não definido. Pulando."); continue
 
-# =============================
-# Filtro por Ano (mantém o ano atual e a última escolha)
-# =============================
-anos = sorted(df["Ano"].unique().tolist())
-ano_atual = pd.Timestamp.today().year
-if ano_atual not in anos:
-    anos.append(ano_atual)
-    anos = sorted(anos)
+                    registro_unico_cli = bool(st.session_state.get(f"ru_{_keyify(cli)}", True))
 
-opcoes_ano = ["Todos"] + anos
+                    if (not registro_unico_cli) and any(ja_existe_atendimento(cli, data, _cap_first(s), combo_cli) for s in str(combo_cli).split("+")):
+                        st.warning(f"⚠️ {cli}: já existia COMBO em {data}. Pulando."); continue
 
-if "ano_selecionado" not in st.session_state:
-    st.session_state["ano_selecionado"] = ano_atual
+                    itens = []
+                    total_bruto = 0.0
+                    for s in str(combo_cli).split("+"):
+                        s2_raw = s.strip()
+                        s2_norm = _cap_first(s2_raw)
+                        val = float(st.session_state.get(f"valor_{_keyify(cli)}_{_keyify(s2_raw)}", obter_valor_servico(s2_norm)))
+                        itens.append((s2_raw, s2_norm, val))
+                        total_bruto += val
 
-valor_inicial = st.session_state["ano_selecionado"]
-if valor_inicial not in opcoes_ano:
-    valor_inicial = ano_atual
+                    # REGISTRO ÚNICO
+                    if registro_unico_cli:
+                        if usar_fiado_cli:
+                            novas.append(_preencher_fiado_vazio({
+                                "Data": data, "Serviço": combo_cli.replace("+", " + "), "Valor": float(total_bruto), "Conta": "Fiado",
+                                "Cliente": cli, "Combo": combo_cli, "Funcionário": func_cli, "Fase": fase,
+                                "Tipo": tipo, "Período": periodo_cli,
+                                "StatusFiado": "Em aberto",
+                                "IDLancFiado": gerar_fiado_id("F"),
+                                "VencimentoFiado": st.session_state.get(f"venc_{_keyify(cli)}", (hoje_br + timedelta(days=15)).strftime("%d/%m/%Y")),
+                                "DataPagamento": ""
+                            }))
+                        elif use_card_cli:
+                            liq_total_cli = float(st.session_state.get(f"liq_{_keyify(cli)}", total_bruto))
+                            novas.append(_preencher_fiado_vazio({
+                                "Data": data, "Serviço": combo_cli.replace("+"," + "), "Valor": liq_total_cli, "Conta": conta_cli,
+                                "Cliente": cli, "Combo": combo_cli, "Funcionário": func_cli, "Fase": fase,
+                                "Tipo": tipo, "Período": periodo_cli,
+                                "ValorBrutoRecebido": float(total_bruto),
+                                "ValorLiquidoRecebido": float(liq_total_cli),
+                                "TaxaCartaoValor": round(float(total_bruto) - float(liq_total_cli), 2),
+                                "TaxaCartaoPct": round(((float(total_bruto) - float(liq_total_cli)) / float(total_bruto) * 100.0), 4) if total_bruto > 0 else 0.0,
+                                "FormaPagDetalhe": f"{st.session_state.get(f'bandeira_{_keyify(cli)}','-')} | {st.session_state.get(f'tipo_cartao_{_keyify(cli)}','Crédito')} | {int(st.session_state.get(f'parc_{_keyify(cli)}',1))}x",
+                                "PagamentoID": gerar_pag_id("A")
+                            }))
+                        else:
+                            novas.append(_preencher_fiado_vazio({
+                                "Data": data, "Serviço": combo_cli.replace("+", " + "), "Valor": float(total_bruto), "Conta": conta_cli,
+                                "Cliente": cli, "Combo": combo_cli, "Funcionário": func_cli, "Fase": fase,
+                                "Tipo": tipo, "Período": periodo_cli
+                            }))
+                        clientes_salvos.add(cli)
+                        funcionario_por_cliente[cli] = func_cli
 
-ano_escolhido = st.selectbox(
-    "📅 Selecione o ano",
-    opcoes_ano,
-    index=opcoes_ano.index(valor_inicial)
-)
-st.session_state["ano_selecionado"] = ano_escolhido
+                    # EXPANDIDO
+                    else:
+                        id_pag = gerar_pag_id("A") if use_card_cli else ""
+                        dist_modo = st.session_state.get(f"dist_{_keyify(cli)}", "Proporcional (padrão)")
+                        alvo = st.session_state.get(f"alvo_{_keyify(cli)}", None)
+                        soma_outros = None
+                        if use_card_cli and dist_modo == "Concentrar em um serviço" and alvo:
+                            soma_outros = sum(val for (r, _, val) in itens if r != alvo)
 
-# =============================
-# Máscara FIADO e base filtrada por ano
-# =============================
-if "Conta" in df.columns:
-    mask_fiado_full = df["Conta"].fillna("").astype(str).str.strip().str.lower().eq("fiado")
-else:
-    mask_fiado_full = pd.Series(False, index=df.index)
+                        for (s_raw, s_norm, bruto_i) in itens:
+                            if usar_fiado_cli:
+                                extras = {
+                                    "StatusFiado": "Em aberto",
+                                    "IDLancFiado": gerar_fiado_id("F"),
+                                    "VencimentoFiado": st.session_state.get(f"venc_{_keyify(cli)}", (hoje_br + timedelta(days=15)).strftime("%d/%m/%Y")),
+                                    "DataPagamento": ""
+                                }
+                                valor_para_base = float(bruto_i)
+                                conta_final = "Fiado"
+                            elif use_card_cli and total_bruto > 0:
+                                liq_total_cli = float(st.session_state.get(f"liq_{_keyify(cli)}", total_bruto))
+                                if dist_modo == "Concentrar em um serviço" and alvo:
+                                    if s_raw == alvo:
+                                        liq_i = liq_total_cli - float(soma_outros or 0.0)
+                                        liq_i = round(max(0.0, liq_i), 2)
+                                    else:
+                                        liq_i = round(float(bruto_i), 2)
+                                else:
+                                    liq_i = round(float(liq_total_cli) * (float(bruto_i) / float(total_bruto)), 2)
+                                taxa_i = round(float(bruto_i) - float(liq_i), 2)
+                                taxa_pct_i = (taxa_i / float(bruto_i) * 100.0) if float(bruto_i) > 0 else 0.0
+                                valor_para_base = float(liq_i)
+                                conta_final = conta_cli
+                                extras = {
+                                    "ValorBrutoRecebido": float(bruto_i),
+                                    "ValorLiquidoRecebido": float(liq_i),
+                                    "TaxaCartaoValor": float(taxa_i),
+                                    "TaxaCartaoPct": round(float(taxa_pct_i), 4),
+                                    "FormaPagDetalhe": f"{st.session_state.get(f'bandeira_{_keyify(cli)}','-')} | {st.session_state.get(f'tipo_cartao_{_keyify(cli)}','Crédito')} | {int(st.session_state.get(f'parc_{_keyify(cli)}',1))}x",
+                                    "PagamentoID": id_pag
+                                }
+                            else:
+                                valor_para_base = float(bruto_i)
+                                conta_final = conta_cli
+                                extras = {}
 
-if ano_escolhido == "Todos":
-    df_base = df.copy()
-else:
-    df_base = df[df["Ano"] == ano_escolhido].copy()
+                            novas.append(_preencher_fiado_vazio({
+                                "Data": data, "Serviço": s_norm, "Valor": valor_para_base, "Conta": conta_final,
+                                "Cliente": cli, "Combo": combo_cli, "Funcionário": func_cli, "Fase": fase,
+                                "Tipo": tipo, "Período": periodo_cli, **extras
+                            }))
 
-mask_fiado = mask_fiado_full.loc[df_base.index]
-df_receita = df_base[~mask_fiado].copy()
-df_fiado = df_base[mask_fiado].copy()
+                        # ajuste centavos expandido (cartão)
+                        if use_card_cli:
+                            indices_cli = [i for i, n in enumerate(novas) if n["Cliente"] == cli and n["Combo"] == combo_cli]
+                            liq_total_cli = float(st.session_state.get(f"liq_{_keyify(cli)}", total_bruto))
+                            soma_liq = sum(float(novas[i]["Valor"]) for i in indices_cli)
+                            delta = round(liq_total_cli - soma_liq, 2)
+                            if abs(delta) >= 0.01 and indices_cli:
+                                idx_ajuste = indices_cli[-1]
+                                if dist_modo == "Concentrar em um serviço" and alvo:
+                                    for i in indices_cli:
+                                        if _norm_key(novas[i]["Serviço"]) == _norm_key(_cap_first(alvo)):
+                                            idx_ajuste = i; break
+                                novas[idx_ajuste]["Valor"] = float(novas[idx_ajuste]["Valor"]) + float(delta)
+                                bsel = float(novas[idx_ajuste].get("ValorBrutoRecebido", 0) or 0)
+                                lsel = float(novas[idx_ajuste]["Valor"])
+                                tsel = round(bsel - lsel, 2)
+                                psel = (tsel / bsel * 100.0) if bsel > 0 else 0.0
+                                novas[idx_ajuste]["ValorLiquidoRecebido"] = lsel
+                                novas[idx_ajuste]["TaxaCartaoValor"] = tsel
+                                novas[idx_ajuste]["TaxaCartaoPct"] = round(psel, 4)
 
-# =============================
-# Indicadores
-# =============================
-clientes_unicos = df_base["Cliente"].nunique()
-contagem_status = df_status["Status"].value_counts().to_dict() if not df_status.empty else {}
-ativos = contagem_status.get("Ativo", 0)
-ignorados = contagem_status.get("Ignorado", 0)
-inativos = contagem_status.get("Inativo", 0)
+                        clientes_salvos.add(cli)
+                        funcionario_por_cliente[cli] = func_cli
+                else:
+                    # SIMPLES
+                    serv_cli = st.session_state.get(f"servico_{_keyify(cli)}", None)
+                    serv_norm = _cap_first(serv_cli) if serv_cli else ""
+                    if not serv_norm:
+                        st.warning(f"⚠️ {cli}: serviço simples não definido. Pulando."); continue
+                    if ja_existe_atendimento(cli, data, serv_norm):
+                        st.warning(f"⚠️ {cli}: já existia atendimento simples ({serv_norm}) em {data}. Pulando."); continue
 
-st.markdown("### 📊 Indicadores Gerais (Feminino)")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("👥 Clientes únicas", clientes_unicos)
-c2.metric("✅ Ativas", ativos)
-c3.metric("🚫 Ignoradas", ignorados)
-c4.metric("🚩 Inativas", inativos)
+                    bruto = float(st.session_state.get(f"valor_{_keyify(cli)}_simples", obter_valor_servico(serv_norm)))
+                    if usar_fiado_cli:
+                        novas.append(_preencher_fiado_vazio({
+                            "Data": data, "Serviço": serv_norm, "Valor": float(bruto), "Conta": "Fiado",
+                            "Cliente": cli, "Combo": "", "Funcionário": func_cli, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_cli,
+                            "StatusFiado": "Em aberto",
+                            "IDLancFiado": gerar_fiado_id("F"),
+                            "VencimentoFiado": st.session_state.get(f"venc_{_keyify(cli)}", (hoje_br + timedelta(days=15)).strftime("%d/%m/%Y")),
+                            "DataPagamento": ""
+                        }))
+                    elif use_card_cli:
+                        liq = float(st.session_state.get(f"liq_{_keyify(cli)}", bruto))
+                        taxa_v = round(max(0.0, float(bruto) - float(liq)), 2)
+                        taxa_pct = round((taxa_v / float(bruto) * 100.0), 4) if float(bruto) > 0 else 0.0
+                        novas.append(_preencher_fiado_vazio({
+                            "Data": data, "Serviço": serv_norm, "Valor": float(liq), "Conta": conta_cli,
+                            "Cliente": cli, "Combo": "", "Funcionário": func_cli, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_cli,
+                            "ValorBrutoRecebido": float(bruto), "ValorLiquidoRecebido": float(liq),
+                            "TaxaCartaoValor": float(taxa_v), "TaxaCartaoPct": float(taxa_pct),
+                            "FormaPagDetalhe": f"{st.session_state.get(f'bandeira_{_keyify(cli)}','-')} | {st.session_state.get(f'tipo_cartao_{_keyify(cli)}','Crédito')} | {int(st.session_state.get(f'parc_{_keyify(cli)}',1))}x",
+                            "PagamentoID": gerar_pag_id("A")
+                        }))
+                    else:
+                        novas.append(_preencher_fiado_vazio({
+                            "Data": data, "Serviço": serv_norm, "Valor": float(bruto), "Conta": conta_cli,
+                            "Cliente": cli, "Combo": "", "Funcionário": func_cli, "Fase": fase,
+                            "Tipo": tipo, "Período": periodo_cli
+                        }))
 
-# Limpa nomes genéricos
-ban = {"boliviano", "brasileiro", "menino", "menino boliviano"}
-for _df in (df_base, df_receita, df_fiado):
-    _df.drop(_df[_df["Cliente"].astype(str).str.lower().str.strip().isin(ban)].index, inplace=True)
+                    clientes_salvos.add(cli)
+                    funcionario_por_cliente[cli] = func_cli
 
-# =============================
-# Receita total por cliente (ano filtrado)
-# =============================
-ranking = (df_receita.groupby("Cliente")["ValorNum"].sum()
-           .reset_index().rename(columns={"ValorNum": "Valor"})
-           .sort_values("Valor", ascending=False))
-ranking["Valor Formatado"] = ranking["Valor"].apply(
-    lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
-)
+            if not novas:
+                st.warning("Nenhuma linha válida para inserir.")
+            else:
+                df_final = pd.concat([df_all, pd.DataFrame(novas)], ignore_index=True)
+                salvar_base(df_final)
+                st.success(f"✅ {len(novas)} linhas inseridas para {len(clientes_salvos)} cliente(s).")
 
-st.subheader("📟 Receita total por cliente (Feminino)")
-busca = st.text_input("🔎 Filtrar por nome").strip()
-if busca:
-    busca_norm = norm(busca)
-    rank_view = ranking[ranking["Cliente"].apply(lambda n: busca_norm in norm(n))]
-else:
-    rank_view = ranking
-st.dataframe(rank_view[["Cliente", "Valor Formatado"]], use_container_width=True)
-
-# Top 5
-st.subheader("🏆 Top 5 Clientes por Receita")
-top5 = ranking.head(5)
-fig_top = px.bar(
-    top5, x="Cliente", y="Valor",
-    text=top5["Valor"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v", ".")),
-    labels={"Valor": "Receita (R$)"}, color="Cliente", template="plotly_dark", height=400
-)
-fig_top.update_traces(textposition="outside", cliponaxis=False)
-fig_top.update_layout(showlegend=False)
-st.plotly_chart(fig_top, use_container_width=True)
-
-# =============================
-# Resultado por cliente por ANO (sempre sem fiado)
-# =============================
-st.subheader("🗓️ Resultado por cliente por ano (sem fiado)")
-
-df_sem_fiado = df[~mask_fiado_full].copy()
-df_sem_fiado = df_sem_fiado[~df_sem_fiado["Cliente"].astype(str).str.lower().str.strip().isin(ban)]
-
-tabela_cliente_ano = (df_sem_fiado
-    .groupby(["Cliente", "Ano"])["ValorNum"].sum()
-    .reset_index()
-    .sort_values(["Cliente", "Ano"]))
-
-pivot_cliente_ano = tabela_cliente_ano.pivot(index="Cliente", columns="Ano", values="ValorNum").fillna(0.0)
-pivot_fmt = pivot_cliente_ano.applymap(lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
-
-st.dataframe(pivot_fmt, use_container_width=True)
-
-if not tabela_cliente_ano.empty:
-    st.markdown("**Evolução por ano (selecione uma cliente):**")
-    clientes_lista = sorted(tabela_cliente_ano["Cliente"].unique().tolist())
-    cliente_sel = st.selectbox("👤 Cliente", clientes_lista, index=0)
-    df_cli = tabela_cliente_ano[tabela_cliente_ano["Cliente"] == cliente_sel]
-    fig_cli = px.bar(
-        df_cli, x="Ano", y="ValorNum",
-        text=df_cli["ValorNum"].apply(lambda x: f"R$ {x:,.0f}".replace(",", "v").replace(".", ",").replace("v", ".")),
-        labels={"ValorNum": "Receita (R$)"}, template="plotly_dark", height=380
-    )
-    fig_cli.update_traces(textposition="outside", cliponaxis=False)
-    st.plotly_chart(fig_cli, use_container_width=True)
-
-# =============================
-# Comparativo entre duas clientes (respeita filtro de ano)
-# =============================
-st.subheader("⚖️ Comparar duas clientes")
-if not ranking.empty:
-    colA, colB = st.columns(2)
-    c1_sel = colA.selectbox("👤 Cliente 1", ranking["Cliente"].tolist())
-    idx2 = 1 if len(ranking) > 1 else 0
-    c2_sel = colB.selectbox("👤 Cliente 2", ranking["Cliente"].tolist(), index=idx2)
-
-    df_c1_val = df_receita[df_receita["Cliente"] == c1_sel]
-    df_c2_val = df_receita[df_receita["Cliente"] == c2_sel]
-    df_c1_hist = df_base[df_base["Cliente"] == c1_sel]
-    df_c2_hist = df_base[df_base["Cliente"] == c2_sel]
-
-    def resumo_cliente(df_val, df_hist):
-        total = df_val["ValorNum"].sum()
-        servicos = df_hist["Serviço"].nunique() if "Serviço" in df_hist.columns else 0
-        media = df_val.groupby("Data")["ValorNum"].sum().mean()
-        media = 0 if pd.isna(media) else media
-        servicos_detalhados = (df_hist["Serviço"].value_counts().rename("Quantidade")
-                               if "Serviço" in df_hist.columns else pd.Series(dtype=int))
-        return pd.Series({
-            "Total Receita": f"R$ {total:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."),
-            "Serviços Distintos": servicos,
-            "Tique Médio": f"R$ {media:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
-        }), servicos_detalhados
-
-    r1, s1 = resumo_cliente(df_c1_val, df_c1_hist)
-    r2, s2 = resumo_cliente(df_c2_val, df_c2_hist)
-    st.dataframe(pd.concat([r1.rename(c1_sel), r2.rename(c2_sel)], axis=1), use_container_width=True)
-    st.markdown("**Serviços Realizados por Tipo**")
-    st.dataframe(pd.concat([s1.rename(c1_sel), s2.rename(c2_sel)].copy(), axis=1).fillna(0).astype(int), use_container_width=True)
-
-# =============================
-# Fiados (respeita filtro de ano)
-# =============================
-st.markdown("### 💳 Fiados — Resumo e Detalhes (Feminino)")
-total_fiado = df_fiado["ValorNum"].sum()
-colf1, colf2, colf3 = st.columns(3)
-colf1.metric("💸 Total em fiado (aberto)", f"R$ {total_fiado:,.2f}".replace(",", "v").replace(".", ",").replace("v", "."))
-colf2.metric("👤 Clientes com fiado", int(df_fiado["Cliente"].nunique()))
-colf3.metric("🧾 Registros de fiado", int(len(df_fiado)))
-
-if not df_fiado.empty:
-    top_fiado = (df_fiado.groupby("Cliente")["ValorNum"].sum()
-                 .reset_index().sort_values("ValorNum", ascending=False).head(10))
-    top_fiado["Valor Formatado"] = top_fiado["ValorNum"].apply(
-        lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
-    )
-    fig_fiado = px.bar(
-        top_fiado, x="Cliente", y="ValorNum", text=top_fiado["Valor Formatado"],
-        labels={"ValorNum": "Fiado (R$)"}, color="Cliente",
-        template="plotly_dark", height=380
-    )
-    fig_fiado.update_traces(textposition="outside", cliponaxis=False)
-    fig_fiado.update_layout(showlegend=False)
-    st.plotly_chart(fig_fiado, use_container_width=True)
-
-    cols_base = ["Data", "Cliente", "Serviço", "ValorNum"] if "Serviço" in df_fiado.columns else ["Data", "Cliente", "ValorNum"]
-    fiado_detalhe = (df_fiado[cols_base]
-                     .sort_values(by=["Cliente", "Data"], ascending=[True, False])
-                     .rename(columns={"ValorNum": "Valor"}))
-    fiado_detalhe["Valor"] = fiado_detalhe["Valor"].apply(
-        lambda x: f"R$ {x:,.2f}".replace(",", "v").replace(".", ",").replace("v", ".")
-    )
-    st.dataframe(fiado_detalhe, use_container_width=True)
-else:
-    st.info("Nenhum fiado em aberto encontrado para os filtros atuais (feminino).")
-
-# =============================
-# Navegar para detalhamento
-# =============================
-st.subheader("🔍 Ver detalhamento de uma cliente")
-if not ranking.empty:
-    cliente_escolhido = st.selectbox("📌 Escolha uma cliente", ranking["Cliente"].tolist())
-    if st.button("➡ Ver detalhes"):
-        st.session_state["cliente"] = cliente_escolhido
-        st.switch_page("pages/2_DetalhesCliente.py")
+                if enviar_cards:
+                    for cli in sorted(clientes_salvos):
+                        func_cli = funcionario_por_cliente.get(cli, FUNCIONARIOS_FEM[0])
+                        pct = pct_por_cliente.get(cli) if func_cli == "Daniela" else None
+                        enviar_card(df_final, cli, func_cli, data, pct_func=pct)
